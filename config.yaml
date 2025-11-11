@@ -28,6 +28,9 @@ paths:
   normalized_images_dir: "temp/normalized"
   candidate_windows_dir: "temp/candidate_windows"
   extracted_features_dir: "temp/extracted_features"
+  
+  # Test set directory (optional - if exists, will be used instead of train/test split)
+  test_set_dir: "test_set"
 
 # Data Processing Configuration
 data:
@@ -163,6 +166,7 @@ evaluation:
     calculate_mape: true  # Mean Absolute Percentage Error
     calculate_mae: true   # Mean Absolute Error
     simulated_images: 10  # Number of simulated images for image-level eval
+    simulated_windows_per_image: 20  # Windows per simulated image
     
   # Visualization settings
   visualization:
@@ -174,8 +178,10 @@ evaluation:
     
   # Detection parameters
   detection:
-    threshold: 0.0  # SVM decision boundary
-    iou_threshold: 0.5  # IoU threshold for NMS
+    threshold: 0.0  # Default SVM decision boundary (will be optimized)
+    iou_threshold: 0.5  # IoU threshold for Non-Maximum Suppression
+    optimize_threshold: true  # Whether to optimize detection threshold
+    threshold_optimization_metric: "f1"  # Metric for threshold optimization
 
 # System Configuration
 system:

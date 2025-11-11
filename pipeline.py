@@ -379,36 +379,15 @@ class NurdleDetectionPipeline:
             if not loaded_models:
                 raise ValueError("Failed to load any trained models")
             
-            # Prepare test data (using a portion of training data for evaluation)
-            # In a real scenario, you would have separate test sets
-            features_dir = Path(self.config.get('paths.extracted_features_dir', 'temp/extracted_features'))
+            # Load test set with proper metadata handling
+            logger.info("Loading test set with enhanced metadata support...")
+            test_set_info = evaluator.test_loader.load_test_set_features_and_metadata()
+            test_data = test_set_info['test_data']
+            window_metadata = test_set_info['window_metadata']
             
-            # Create test sets from available data
-            test_data = {}
-            test_split_ratio = self.config.get_section('evaluation').get('test_split_ratio', 0.2)
-            
-            for feature_type in loaded_models.keys():
-                feature_file = features_dir / f'{feature_type}_features.npy'
-                labels_file = features_dir / f'{feature_type}_labels.npy'
-                
-                if feature_file.exists() and labels_file.exists():
-                    features = np.load(feature_file)
-                    labels = np.load(labels_file)
-                    
-                    # Simple train/test split (last 20% for testing)
-                    n_samples = len(features)
-                    n_test = int(n_samples * test_split_ratio)
-                    
-                    if n_test > 0:
-                        test_features = features[-n_test:]
-                        test_labels = labels[-n_test:]
-                        
-                        test_data[feature_type] = {
-                            'features': test_features,
-                            'labels': test_labels
-                        }
-                        
-                        logger.info(f"Created test set for {feature_type}: {test_features.shape}")
+            logger.info(f"Test set loaded from: {test_set_info['source']}")
+            for feature_type, data in test_data.items():
+                logger.info(f"Test {feature_type}: {data['features'].shape}")
             
             # Evaluate each model
             evaluation_results = {}
@@ -443,9 +422,9 @@ class NurdleDetectionPipeline:
             else:
                 comparison_results = {}
             
-            # Generate image-level evaluation (simulated)
-            logger.info("Calculating image-level performance...")
-            image_level_results = evaluator.evaluate_image_level_performance(evaluation_results)
+            # Generate image-level evaluation with proper metadata
+            logger.info("Calculating image-level performance with NMS and proper aggregation...")
+            image_level_results = evaluator.evaluate_image_level_performance(evaluation_results, window_metadata)
             
             # Create visualizations
             logger.info("Creating evaluation visualizations...")

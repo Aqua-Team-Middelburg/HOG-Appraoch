@@ -27,6 +27,289 @@ from ..utils.config import ConfigLoader
 logger = logging.getLogger(__name__)
 
 
+class TestSetLoader:
+    """
+    Loads and processes test set data with proper image-window mapping.
+    """
+    
+    def __init__(self, config: ConfigLoader):
+        self.config = config
+        
+    def load_test_set_features_and_metadata(self) -> Dict[str, Any]:
+        """
+        Load test set features and create proper window-to-image mapping.
+        
+        Returns:
+            Dictionary containing test features, labels, and metadata
+        """
+        logger.info("Loading test set with proper image-window mapping...")
+        
+        # Try to load from separate test set first
+        test_set_dir = Path(self.config.get('paths.test_set_dir', 'test_set'))
+        
+        if test_set_dir.exists():
+            return self._load_separate_test_set(test_set_dir)
+        else:
+            return self._create_test_split_from_training()
+    
+    def _load_separate_test_set(self, test_dir: Path) -> Dict[str, Any]:
+        """Load features from separate test set directory."""
+        logger.info(f"Loading separate test set from {test_dir}")
+        
+        # Look for test set features
+        test_features_dir = test_dir / 'features'
+        if not test_features_dir.exists():
+            logger.warning(f"Test features directory not found: {test_features_dir}")
+            return self._create_test_split_from_training()
+        
+        test_data = {}
+        window_metadata = {}
+        
+        for feature_type in ['hog', 'lbp', 'combined']:
+            feature_file = test_features_dir / f'{feature_type}_features.npy'
+            labels_file = test_features_dir / f'{feature_type}_labels.npy'
+            metadata_file = test_features_dir / f'{feature_type}_window_metadata.json'
+            
+            if feature_file.exists() and labels_file.exists():
+                features = np.load(feature_file)
+                labels = np.load(labels_file)
+                
+                test_data[feature_type] = {
+                    'features': features,
+                    'labels': labels
+                }
+                
+                # Load window metadata if available
+                if metadata_file.exists():
+                    with open(metadata_file, 'r') as f:
+                        window_metadata[feature_type] = json.load(f)
+                
+                logger.info(f"Loaded test {feature_type}: {features.shape}")
+        
+        return {
+            'test_data': test_data,
+            'window_metadata': window_metadata,
+            'source': 'separate_test_set'
+        }
+    
+    def _create_test_split_from_training(self) -> Dict[str, Any]:
+        """Create test split from training data with enhanced metadata."""
+        logger.info("Creating test split from training data...")
+        
+        features_dir = Path(self.config.get('paths.extracted_features_dir', 'temp/extracted_features'))
+        test_split_ratio = self.config.get_section('evaluation').get('test_split_ratio', 0.2)
+        
+        test_data = {}
+        window_metadata = {}
+        
+        for feature_type in ['hog', 'lbp', 'combined']:
+            feature_file = features_dir / f'{feature_type}_features.npy'
+            labels_file = features_dir / f'{feature_type}_labels.npy'
+            
+            if feature_file.exists() and labels_file.exists():
+                features = np.load(feature_file)
+                labels = np.load(labels_file)
+                
+                # Create stratified test split
+                from sklearn.model_selection import train_test_split
+                
+                _, test_features, _, test_labels = train_test_split(
+                    features, labels, 
+                    test_size=test_split_ratio, 
+                    stratify=labels,
+                    random_state=42
+                )
+                
+                test_data[feature_type] = {
+                    'features': test_features,
+                    'labels': test_labels
+                }
+                
+                # Create simulated window metadata for image grouping
+                window_metadata[feature_type] = self._create_simulated_metadata(len(test_features))
+                
+                logger.info(f"Created test {feature_type}: {test_features.shape}")
+        
+        return {
+            'test_data': test_data,
+            'window_metadata': window_metadata,
+            'source': 'training_split'
+        }
+    
+    def _create_simulated_metadata(self, n_windows: int) -> Dict[str, Any]:
+        """Create simulated window-to-image mapping."""
+        windows_per_image = self.config.get_section('evaluation').get('simulated_windows_per_image', 20)
+        n_images = max(1, n_windows // windows_per_image)
+        
+        metadata = {
+            'window_to_image': {},
+            'image_info': {},
+            'windows_per_image': windows_per_image
+        }
+        
+        for i in range(n_windows):
+            image_id = f"test_image_{i // windows_per_image}"
+            metadata['window_to_image'][str(i)] = {
+                'image_id': image_id,
+                'window_index': i % windows_per_image
+            }
+        
+        for i in range(n_images):
+            image_id = f"test_image_{i}"
+            metadata['image_info'][image_id] = {
+                'total_windows': min(windows_per_image, n_windows - i * windows_per_image)
+            }
+        
+        return metadata
+
+
+class NonMaximumSuppression:
+    """
+    Non-Maximum Suppression for removing duplicate detections.
+    """
+    
+    @staticmethod
+    def calculate_iou(box1: List[float], box2: List[float]) -> float:
+        """
+        Calculate Intersection over Union (IoU) between two bounding boxes.
+        
+        Args:
+            box1: [x1, y1, x2, y2] format
+            box2: [x1, y1, x2, y2] format
+            
+        Returns:
+            IoU value between 0 and 1
+        """
+        # Calculate intersection coordinates
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        # Calculate intersection area
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        
+        intersection = (x2 - x1) * (y2 - y1)
+        
+        # Calculate union area
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    @staticmethod
+    def apply_nms(detections: List[Dict[str, Any]], iou_threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Apply Non-Maximum Suppression to detection results.
+        
+        Args:
+            detections: List of detection dictionaries with 'bbox', 'score', 'label'
+            iou_threshold: IoU threshold for suppression
+            
+        Returns:
+            Filtered list of detections after NMS
+        """
+        if not detections:
+            return []
+        
+        # Sort detections by score in descending order
+        detections = sorted(detections, key=lambda x: x['score'], reverse=True)
+        
+        kept_detections = []
+        
+        while detections:
+            # Keep the detection with highest score
+            current = detections.pop(0)
+            kept_detections.append(current)
+            
+            # Remove detections with high IoU overlap
+            remaining = []
+            for detection in detections:
+                iou = NonMaximumSuppression.calculate_iou(
+                    current['bbox'], 
+                    detection['bbox']
+                )
+                
+                if iou <= iou_threshold:
+                    remaining.append(detection)
+                # else: detection is suppressed (too much overlap)
+            
+            detections = remaining
+        
+        return kept_detections
+
+
+class ThresholdOptimizer:
+    """
+    Optimizes detection thresholds for each model using validation curves.
+    """
+    
+    def __init__(self, config: ConfigLoader):
+        self.config = config
+    
+    def optimize_threshold(self, 
+                          y_true: np.ndarray, 
+                          y_scores: np.ndarray,
+                          metric: str = 'f1') -> Dict[str, Any]:
+        """
+        Find optimal decision threshold using validation curve.
+        
+        Args:
+            y_true: True binary labels
+            y_scores: Model decision scores or probabilities
+            metric: Optimization metric ('f1', 'precision', 'recall', 'accuracy')
+            
+        Returns:
+            Dictionary with optimal threshold and metrics
+        """
+        if y_scores is None:
+            return {
+                'optimal_threshold': 0.0,
+                'optimal_score': 0.0,
+                'thresholds': [0.0],
+                'scores': [0.0],
+                'method': 'default'
+            }
+        
+        # Generate threshold range
+        min_score = np.min(y_scores)
+        max_score = np.max(y_scores)
+        thresholds = np.linspace(min_score, max_score, 100)
+        
+        scores = []
+        
+        for threshold in thresholds:
+            y_pred = (y_scores >= threshold).astype(int)
+            
+            if metric == 'f1':
+                score = f1_score(y_true, y_pred, zero_division=0)
+            elif metric == 'precision':
+                score = precision_score(y_true, y_pred, zero_division=0)
+            elif metric == 'recall':
+                score = recall_score(y_true, y_pred, zero_division=0)
+            elif metric == 'accuracy':
+                score = accuracy_score(y_true, y_pred)
+            else:
+                score = f1_score(y_true, y_pred, zero_division=0)
+            
+            scores.append(score)
+        
+        # Find optimal threshold
+        best_idx = np.argmax(scores)
+        optimal_threshold = thresholds[best_idx]
+        optimal_score = scores[best_idx]
+        
+        return {
+            'optimal_threshold': float(optimal_threshold),
+            'optimal_score': float(optimal_score),
+            'thresholds': thresholds.tolist(),
+            'scores': scores,
+            'method': 'validation_curve'
+        }
+
+
 class ModelEvaluator:
     """
     Comprehensive model evaluation with multiple metrics and visualizations.
@@ -52,6 +335,12 @@ class ModelEvaluator:
         eval_config = config.get_section('evaluation')
         self.metrics_config = eval_config.get('metrics', {})
         self.visualization_config = eval_config.get('visualization', {})
+        self.detection_config = eval_config.get('detection', {})
+        
+        # Initialize helper classes
+        self.test_loader = TestSetLoader(config)
+        self.nms = NonMaximumSuppression()
+        self.threshold_optimizer = ThresholdOptimizer(config)
         
         # Paths
         self.figures_dir = Path(config.get('paths.output_dir')) / config.get('paths.figures_dir')
@@ -60,7 +349,7 @@ class ModelEvaluator:
         # Results storage
         self.evaluation_results = {}
         
-        logger.info("Model evaluator initialized")
+        logger.info("Model evaluator initialized with NMS and threshold optimization")
     
     def evaluate_single_model(self,
                              model_package: Dict[str, Any],
@@ -90,21 +379,42 @@ class ModelEvaluator:
         # Predictions
         predictions = model.predict(scaled_features)
         
-        # Probabilities (if available)
-        try:
-            if hasattr(model, 'predict_proba'):
-                probabilities = model.predict_proba(scaled_features)[:, 1]
-            elif hasattr(model, 'decision_function'):
-                probabilities = model.decision_function(scaled_features)
-                # Normalize to [0,1] for consistency
-                probabilities = (probabilities - probabilities.min()) / (probabilities.max() - probabilities.min())
-            else:
-                probabilities = None
-        except Exception:
-            probabilities = None
+        # Get decision scores (for threshold optimization)
+        decision_scores = None
+        probabilities = None
         
-        # Basic classification metrics
-        metrics = self._calculate_classification_metrics(test_labels, predictions, probabilities)
+        try:
+            if hasattr(model, 'decision_function'):
+                decision_scores = model.decision_function(scaled_features)
+                probabilities = decision_scores  # Use decision scores as probabilities
+            elif hasattr(model, 'predict_proba'):
+                probabilities = model.predict_proba(scaled_features)[:, 1]
+                decision_scores = probabilities
+        except Exception as e:
+            logger.warning(f"Could not get decision scores: {e}")
+        
+        # Optimize decision threshold
+        if decision_scores is not None:
+            threshold_results = self.threshold_optimizer.optimize_threshold(
+                test_labels, decision_scores, metric='f1'
+            )
+            optimal_threshold = threshold_results['optimal_threshold']
+            
+            # Make predictions with optimal threshold
+            optimized_predictions = (decision_scores >= optimal_threshold).astype(int)
+        else:
+            threshold_results = {'optimal_threshold': 0.0, 'optimal_score': 0.0, 'method': 'default'}
+            optimized_predictions = predictions
+            optimal_threshold = 0.0
+        
+        # Basic classification metrics (with default threshold)
+        default_metrics = self._calculate_classification_metrics(test_labels, predictions, probabilities)
+        
+        # Optimized metrics (with optimal threshold)  
+        optimized_metrics = self._calculate_classification_metrics(test_labels, optimized_predictions, probabilities)
+        
+        # Use optimized metrics as primary metrics
+        metrics = optimized_metrics
         
         # Detailed classification report
         report = classification_report(test_labels, predictions, output_dict=True)
@@ -116,11 +426,17 @@ class ModelEvaluator:
         results = {
             'model_name': model_name,
             'metrics': metrics,
+            'default_metrics': default_metrics,
+            'optimized_metrics': optimized_metrics,
+            'threshold_optimization': threshold_results,
+            'optimal_threshold': optimal_threshold,
             'classification_report': report,
             'confusion_matrix': cm.tolist(),
             'predictions': predictions.tolist(),
+            'optimized_predictions': optimized_predictions.tolist(),
             'test_labels': test_labels.tolist(),
             'probabilities': probabilities.tolist() if probabilities is not None else None,
+            'decision_scores': decision_scores.tolist() if decision_scores is not None else None,
             'test_samples': len(test_labels),
             'positive_samples': int(np.sum(test_labels)),
             'negative_samples': int(len(test_labels) - np.sum(test_labels)),
@@ -211,82 +527,177 @@ class ModelEvaluator:
     
     def evaluate_image_level_performance(self,
                                        model_results: Dict[str, Dict[str, Any]],
-                                       image_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+                                       window_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
         """
-        Evaluate performance at image level by aggregating window predictions.
+        Evaluate performance at image level by aggregating window predictions with NMS.
         
         Args:
             model_results: Results from window-level evaluation
-            image_metadata: Optional metadata mapping windows to images
+            window_metadata: Window-to-image mapping metadata
             
         Returns:
-            Image-level evaluation results
+            Image-level evaluation results with proper aggregation
         """
-        logger.info("Calculating image-level performance metrics")
+        logger.info("Calculating image-level performance with proper window aggregation")
+        
+        # Load test set with metadata if not provided
+        if window_metadata is None:
+            test_set_info = self.test_loader.load_test_set_features_and_metadata()
+            window_metadata = test_set_info.get('window_metadata', {})
+        
+        # Ensure window_metadata is a dict
+        if window_metadata is None:
+            window_metadata = {}
         
         image_level_results = {}
+        nms_threshold = self.detection_config.get('iou_threshold', 0.5)
         
         for model_name, results in model_results.items():
             if 'error' in results:
                 continue
                 
-            predictions = np.array(results['predictions'])
+            # Use optimized predictions if available
+            predictions = np.array(results.get('optimized_predictions', results['predictions']))
             true_labels = np.array(results['test_labels'])
-            probabilities = results.get('probabilities')
+            decision_scores = results.get('decision_scores')
             
-            if probabilities is not None:
-                probabilities = np.array(probabilities)
+            if decision_scores is not None:
+                decision_scores = np.array(decision_scores)
             
-            # If no image metadata provided, treat each prediction as separate image
-            if image_metadata is None:
-                logger.warning("No image metadata provided for image-level evaluation")
-                image_level_results[model_name] = results  # Return window-level results
+            # Get window metadata for this feature type
+            feature_type = model_name
+            metadata = window_metadata.get(feature_type, {})
+            window_to_image = metadata.get('window_to_image', {})
+            
+            if not window_to_image:
+                # Fallback to simulated grouping
+                logger.warning(f"No window metadata for {model_name}, using simulated grouping")
+                image_level_results[model_name] = self._simulate_image_level_evaluation(
+                    predictions, true_labels, decision_scores
+                )
                 continue
             
             # Group predictions by image
-            image_predictions = defaultdict(list)
-            image_labels = defaultdict(list)
-            image_probabilities = defaultdict(list) if probabilities is not None else None
+            image_groups = defaultdict(list)
             
-            # This would require proper window-to-image mapping
-            # For now, simulate image-level aggregation
-            n_images = self.metrics_config.get('simulated_images', 10)
-            windows_per_image = len(predictions) // n_images
-            
-            image_level_preds = []
-            image_level_labels = []
-            
-            for i in range(n_images):
-                start_idx = i * windows_per_image
-                end_idx = (i + 1) * windows_per_image if i < n_images - 1 else len(predictions)
+            for window_idx in range(len(predictions)):
+                window_info = window_to_image.get(str(window_idx), {})
+                image_id = window_info.get('image_id', f'unknown_image_{window_idx // 20}')
                 
-                window_preds = predictions[start_idx:end_idx]
-                window_labels = true_labels[start_idx:end_idx]
+                detection = {
+                    'prediction': predictions[window_idx],
+                    'true_label': true_labels[window_idx],
+                    'score': decision_scores[window_idx] if decision_scores is not None else predictions[window_idx],
+                    'window_index': window_idx,
+                    'bbox': [0, 0, 40, 40]  # Simulated bbox for NMS
+                }
                 
-                # Image is positive if any window is positive (OR aggregation)
-                image_pred = 1 if np.any(window_preds) else 0
-                image_label = 1 if np.any(window_labels) else 0
-                
-                image_level_preds.append(image_pred)
-                image_level_labels.append(image_label)
+                image_groups[image_id].append(detection)
             
-            # Calculate image-level metrics
+            # Evaluate each image
+            image_predictions = []
+            image_labels = []
+            image_counts_pred = []
+            image_counts_true = []
+            
+            for image_id, detections in image_groups.items():
+                # Apply NMS to predicted detections
+                positive_detections = [
+                    {
+                        'bbox': det['bbox'],
+                        'score': float(det['score']),
+                        'label': int(det['prediction'])
+                    }
+                    for det in detections if det['prediction'] == 1
+                ]
+                
+                filtered_detections = self.nms.apply_nms(positive_detections, nms_threshold)
+                
+                # Count predictions and ground truth
+                pred_count = len(filtered_detections)
+                true_count = sum(det['true_label'] for det in detections)
+                
+                # Image-level binary classification (any detection = positive)
+                image_pred = 1 if pred_count > 0 else 0
+                image_true = 1 if true_count > 0 else 0
+                
+                image_predictions.append(image_pred)
+                image_labels.append(image_true)
+                image_counts_pred.append(pred_count)
+                image_counts_true.append(true_count)
+            
+            # Calculate image-level binary metrics
             image_metrics = self._calculate_classification_metrics(
-                np.array(image_level_labels),
-                np.array(image_level_preds)
+                np.array(image_labels),
+                np.array(image_predictions)
             )
+            
+            # Calculate count-based metrics (MAPE, MAE)
+            if image_counts_true:
+                mae = float(np.mean(np.abs(np.array(image_counts_pred) - np.array(image_counts_true))))
+                
+                # Calculate MAPE (handle division by zero)
+                percentage_errors = []
+                for pred, true in zip(image_counts_pred, image_counts_true):
+                    if true > 0:
+                        percentage_errors.append(abs((pred - true) / true))
+                
+                mape = float(np.mean(percentage_errors) * 100) if percentage_errors else 0.0
+                
+                image_metrics['mae'] = mae
+                image_metrics['mape'] = mape
             
             image_level_results[model_name] = {
                 'metrics': image_metrics,
-                'predictions': image_level_preds,
-                'labels': image_level_labels,
-                'n_images': n_images,
-                'aggregation_method': 'OR'
+                'predictions': image_predictions,
+                'labels': image_labels,
+                'count_predictions': image_counts_pred,
+                'count_labels': image_counts_true,
+                'n_images': len(image_groups),
+                'aggregation_method': 'NMS',
+                'nms_threshold': nms_threshold
             }
             
-            logger.info(f"{model_name} image-level F1: {image_metrics['f1_score']:.4f}")
+            logger.info(f"{model_name} image-level F1: {image_metrics.get('f1_score', 0):.4f}, "
+                       f"MAE: {image_metrics.get('mae', 0):.2f}, MAPE: {image_metrics.get('mape', 0):.2f}%")
         
         return image_level_results
+    
+    def _simulate_image_level_evaluation(self, predictions, true_labels, decision_scores):
+        """Fallback method for simulated image-level evaluation."""
+        n_images = self.metrics_config.get('simulated_images', 10)
+        windows_per_image = len(predictions) // n_images
+        
+        image_level_preds = []
+        image_level_labels = []
+        
+        for i in range(n_images):
+            start_idx = i * windows_per_image
+            end_idx = (i + 1) * windows_per_image if i < n_images - 1 else len(predictions)
+            
+            window_preds = predictions[start_idx:end_idx]
+            window_labels = true_labels[start_idx:end_idx]
+            
+            # Image is positive if any window is positive (OR aggregation)
+            image_pred = 1 if np.any(window_preds) else 0
+            image_label = 1 if np.any(window_labels) else 0
+            
+            image_level_preds.append(image_pred)
+            image_level_labels.append(image_label)
+        
+        # Calculate image-level metrics
+        image_metrics = self._calculate_classification_metrics(
+            np.array(image_level_labels),
+            np.array(image_level_preds)
+        )
+        
+        return {
+            'metrics': image_metrics,
+            'predictions': image_level_preds,
+            'labels': image_level_labels,
+            'n_images': n_images,
+            'aggregation_method': 'OR_simulation'
+        }
     
     def compare_models(self, model_results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -388,6 +799,11 @@ class ModelEvaluator:
             pr_path = self._create_pr_curves(model_results)
             if pr_path:
                 visualization_paths['pr_curves'] = str(pr_path)
+        
+        # 5. Threshold optimization plots
+        threshold_path = self._create_threshold_optimization_plot(model_results)
+        if threshold_path:
+            visualization_paths['threshold_optimization'] = str(threshold_path)
         
         logger.info(f"Created {len(visualization_paths)} visualizations")
         return visualization_paths
@@ -546,6 +962,56 @@ class ModelEvaluator:
             
         except Exception as e:
             logger.error(f"Failed to create PR curves: {e}")
+            return None
+    
+    def _create_threshold_optimization_plot(self, model_results: Dict[str, Dict[str, Any]]) -> Optional[Path]:
+        """Create threshold optimization plot showing F1 vs threshold curves."""
+        try:
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            plotted_models = 0
+            
+            for model_name, results in model_results.items():
+                if 'error' in results:
+                    continue
+                    
+                threshold_info = results.get('threshold_optimization', {})
+                
+                if threshold_info.get('method') == 'validation_curve':
+                    thresholds = threshold_info.get('thresholds', [])
+                    scores = threshold_info.get('scores', [])
+                    optimal_threshold = threshold_info.get('optimal_threshold', 0)
+                    optimal_score = threshold_info.get('optimal_score', 0)
+                    
+                    if thresholds and scores:
+                        ax.plot(thresholds, scores, label=f'{model_name}', linewidth=2)
+                        
+                        # Mark optimal point
+                        ax.scatter([optimal_threshold], [optimal_score], 
+                                 s=100, marker='o', 
+                                 label=f'{model_name} optimal (F1={optimal_score:.3f})')
+                        
+                        plotted_models += 1
+            
+            if plotted_models == 0:
+                return None
+            
+            ax.set_xlabel('Decision Threshold')
+            ax.set_ylabel('F1 Score')
+            ax.set_title('Threshold Optimization - F1 Score vs Decision Threshold')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Save plot
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            plot_path = self.figures_dir / f'threshold_optimization_{timestamp}.png'
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            return plot_path
+            
+        except Exception as e:
+            logger.error(f"Failed to create threshold optimization plot: {e}")
             return None
     
     def save_evaluation_report(self, 
