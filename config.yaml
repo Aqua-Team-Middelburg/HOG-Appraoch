@@ -1,0 +1,263 @@
+# HOG/LBP/SVM Pipeline Configuration
+# ===================================
+# This file contains all configurable parameters for the nurdle detection pipeline.
+# Modify these values to customize the behavior without changing code.
+
+# Project Information
+project:
+  name: "Nurdle Detection Pipeline"
+  version: "1.0.0"
+  description: "HOG/LBP feature extraction with SVM classification for nurdle detection"
+  
+# File Paths and Directories
+paths:
+  # Input directory containing raw images and JSON annotation files
+  input_dir: "input"
+  
+  # Output directory for all generated files
+  output_dir: "output"
+  
+  # Subdirectories under output_dir
+  models_dir: "models"
+  evaluations_dir: "evaluations" 
+  visualizations_dir: "visualizations"
+  logs_dir: "logs"
+  
+  # Temporary directories for intermediate processing
+  temp_dir: "temp"
+  normalized_images_dir: "temp/normalized"
+  candidate_windows_dir: "temp/candidate_windows"
+  extracted_features_dir: "temp/extracted_features"
+
+# Data Processing Configuration
+data:
+  # Train/test split configuration
+  test_size: 0.3  # Fraction of data to use for testing (0.0-1.0)
+  random_state: 42  # Random seed for reproducible splits
+  stratify: true  # Whether to maintain class balance in train/test split
+  
+  # Data validation settings
+  min_images_required: 10  # Minimum number of images needed to run pipeline
+  validate_json_format: true  # Whether to validate JSON annotation format
+  
+  # Image format requirements
+  supported_formats: [".jpg", ".jpeg", ".png", ".bmp", ".tiff"]
+  max_image_size_mb: 50  # Maximum allowed image file size in MB
+
+# Image Preprocessing Configuration
+preprocessing:
+  # Target window size for all processing (width, height)
+  target_size: [40, 40]
+  
+  # Image normalization settings
+  normalization:
+    target_max_dimension: 1080  # Maximum dimension for normalized images
+    preserve_aspect_ratio: true  # Maintain aspect ratios during resize
+  
+  # Contrast enhancement method
+  # Options: "contrast_stretch", "histogram_eq", "adaptive_eq", "none"
+  contrast_method: "contrast_stretch"
+  
+  # Parameters for contrast stretching (percentile clipping)
+  contrast_percentiles: [2, 98]  # [lower_percentile, upper_percentile]
+  
+  # Parameters for adaptive histogram equalization (CLAHE)
+  clahe:
+    clip_limit: 2.0  # Contrast limiting threshold
+    tile_grid_size: [2, 2]  # Size of neighborhood for local histogram calculation
+  
+  # Sliding window configuration for candidate generation
+  sliding_window:
+    window_size: [40, 40]  # Size of sliding window
+    stride: 20  # Step size between windows (smaller = more overlap)
+    
+    # Boundary handling
+    pad_image: true  # Whether to pad image to ensure full coverage
+    min_window_coverage: 0.8  # Minimum fraction of window that must be inside image
+
+# Feature Extraction Configuration
+features:
+  # Histogram of Oriented Gradients (HOG) parameters
+  hog:
+    orientations: 9  # Number of orientation bins
+    pixels_per_cell: [8, 8]  # Size of cells in pixels (width, height)
+    cells_per_block: [2, 2]  # Size of blocks in cells (width, height)
+    block_norm: "L2-Hys"  # Block normalization method
+    transform_sqrt: false  # Whether to apply power law compression
+    
+  # Local Binary Pattern (LBP) parameters
+  lbp:
+    n_points: 8  # Number of sample points on circle
+    radius: 1  # Radius of circle
+    method: "uniform"  # LBP method: "uniform", "nri_uniform", "default"
+    
+  # Feature combination settings
+  combination:
+    # Which features to extract: "hog", "lbp", "combined"
+    feature_types: ["hog", "lbp", "combined"]
+    
+    # Whether to normalize features before combining
+    normalize_before_combine: false
+
+# Model Training Configuration
+training:
+  # IoU threshold for positive window labeling
+  iou_threshold: 0.5
+  
+  # Ground truth bounding box normalization size
+  gt_bbox_size: 40
+  
+  # Support Vector Machine (SVM) parameters
+  svm:
+    # SVM type and kernel
+    kernel: "linear"  # "linear", "poly", "rbf", "sigmoid"
+    C: 1.0  # Regularization parameter
+    gamma: "scale"  # Kernel coefficient for rbf/poly/sigmoid
+    
+    # Training parameters
+    max_iter: 1000  # Maximum number of iterations
+    random_state: 42  # Random seed for reproducible results
+    
+    # Class balancing
+    class_weight: null  # "balanced" for automatic balancing, null for no balancing
+    
+  # Cross-validation settings
+  cross_validation:
+    enabled: true
+    folds: 5  # Number of CV folds
+    scoring: "f1"  # Scoring metric: "accuracy", "precision", "recall", "f1"
+    
+  # Feature scaling
+  scaling:
+    method: "standard"  # "standard", "minmax", "robust", "none"
+    
+  # Model selection and hyperparameter tuning
+  hyperparameter_tuning:
+    enabled: false  # Whether to perform grid search
+    param_grid:
+      C: [0.1, 1.0, 10.0]
+      gamma: ["scale", "auto", 0.001, 0.01]
+    cv_folds: 3  # Folds for hyperparameter CV
+    
+  # Ensemble methods
+  ensemble:
+    # Stacking classifier configuration
+    stacking:
+      enabled: true  # Whether to train stacking ensemble
+      base_models: ["hog_svm", "lbp_svm", "combined_svm"]  # Models to stack
+      meta_classifier: "linear_regression"  # Meta-learner type
+      cv_folds: 3  # Folds for stacking CV
+
+# Evaluation Configuration  
+evaluation:
+  # Metrics to calculate
+  metrics:
+    # Classification metrics (per-window)
+    window_level: ["precision", "recall", "f1", "accuracy", "auc_roc"]
+    
+    # Object detection metrics (per-image)
+    image_level: ["precision", "recall", "f1", "map", "mape", "mae"]
+    
+  # Detection and matching parameters
+  detection:
+    # Score threshold for positive detection
+    threshold: 0.0  # SVM decision boundary (can be tuned)
+    
+    # Non-maximum suppression
+    nms:
+      enabled: true
+      iou_threshold: 0.5  # IoU threshold for considering boxes as overlapping
+      
+    # Ground truth matching
+    matching:
+      iou_threshold: 0.5  # IoU threshold for considering detection as correct
+      
+  # Visualization settings
+  visualization:
+    # What to visualize
+    generate_plots: true
+    save_detection_images: true  # Save images with predicted bounding boxes
+    plot_metrics: true  # Generate metric plots
+    plot_confusion_matrix: true
+    plot_roc_curve: true
+    
+    # Plot styling
+    figure_size: [12, 8]  # Default figure size (width, height)
+    dpi: 150  # Image resolution for saved plots
+    
+    # Colors for visualization
+    colors:
+      true_positive: "green"
+      false_positive: "red" 
+      false_negative: "orange"
+      ground_truth: "blue"
+
+# System Configuration
+system:
+  # Logging configuration
+  logging:
+    level: "INFO"  # "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    file_logging: true  # Whether to log to file
+    console_logging: true  # Whether to log to console
+    
+  # Performance and resource settings
+  performance:
+    # Parallel processing
+    n_jobs: -1  # Number of parallel jobs (-1 for all cores, 1 for no parallelism)
+    
+    # Memory management
+    batch_size: 1000  # Batch size for processing large datasets
+    memory_limit_gb: 8  # Memory limit in GB (for monitoring)
+    
+    # Progress reporting
+    show_progress: true  # Whether to show progress bars
+    progress_update_interval: 100  # Update progress every N items
+    
+  # Reproducibility
+  reproducibility:
+    set_random_seeds: true  # Whether to set random seeds for reproducibility
+    random_seed: 42  # Master random seed
+    
+  # Development and debugging
+  debug:
+    save_intermediate_results: false  # Save intermediate processing results
+    verbose_logging: false  # Enable verbose logging for debugging
+    profile_performance: false  # Enable performance profiling
+
+# Model Management
+model_management:
+  # Model saving and loading
+  save_models: true  # Whether to save trained models
+  model_format: "joblib"  # "joblib" or "pickle"
+  
+  # Model versioning
+  versioning:
+    enabled: true
+    include_timestamp: true  # Include timestamp in model filenames
+    include_config_hash: false  # Include config hash for reproducibility
+    
+  # Model metadata
+  save_metadata: true  # Save model training metadata
+  metadata_format: "json"  # Format for metadata files
+
+# Pipeline Control
+pipeline:
+  # Which steps to run (useful for partial execution)
+  steps:
+    normalization: true
+    train_test_split: true
+    sliding_window_processing: true
+    feature_extraction: true
+    model_training: true
+    evaluation: true
+    
+  # Error handling
+  error_handling:
+    continue_on_error: false  # Whether to continue pipeline if a step fails
+    save_error_logs: true  # Save detailed error information
+    
+  # Cleanup
+  cleanup:
+    remove_temp_files: true  # Clean up temporary files after completion
+    keep_intermediate_results: false  # Keep intermediate results for inspection
