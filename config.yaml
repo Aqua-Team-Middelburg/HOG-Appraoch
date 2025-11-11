@@ -133,64 +133,49 @@ training:
     
   # Model selection and hyperparameter tuning
   hyperparameter_tuning:
-    enabled: false  # Whether to perform grid search
-    param_grid:
-      C: [0.1, 1.0, 10.0]
-      gamma: ["scale", "auto", 0.001, 0.01]
+    enabled: true  # Whether to perform hyperparameter optimization
+    use_optuna: true  # Use Optuna for optimization (if available)
+    n_trials: 50  # Number of Optuna trials
     cv_folds: 3  # Folds for hyperparameter CV
+    
+    # Fallback GridSearch parameters (used if Optuna not available)
+    param_grid:
+      C: [0.1, 1.0, 10.0, 100.0]
+      kernel: ["linear", "rbf"]
+      gamma: ["scale", "auto"]
     
   # Ensemble methods
   ensemble:
     # Stacking classifier configuration
     stacking:
       enabled: true  # Whether to train stacking ensemble
-      base_models: ["hog_svm", "lbp_svm", "combined_svm"]  # Models to stack
-      meta_classifier: "linear_regression"  # Meta-learner type
+      base_models: ["hog", "lbp"]  # Feature types for base models
+      meta_classifier: "logistic_regression"  # "logistic_regression" or "svm"
       cv_folds: 3  # Folds for stacking CV
 
 # Evaluation Configuration  
 evaluation:
-  # Metrics to calculate
+  # Test set configuration
+  test_split_ratio: 0.2  # Portion of data reserved for testing
+  
+  # Metrics configuration
   metrics:
-    # Classification metrics (per-window)
-    window_level: ["precision", "recall", "f1", "accuracy", "auc_roc"]
+    calculate_mape: true  # Mean Absolute Percentage Error
+    calculate_mae: true   # Mean Absolute Error
+    simulated_images: 10  # Number of simulated images for image-level eval
     
-    # Object detection metrics (per-image)
-    image_level: ["precision", "recall", "f1", "map", "mape", "mae"]
-    
-  # Detection and matching parameters
-  detection:
-    # Score threshold for positive detection
-    threshold: 0.0  # SVM decision boundary (can be tuned)
-    
-    # Non-maximum suppression
-    nms:
-      enabled: true
-      iou_threshold: 0.5  # IoU threshold for considering boxes as overlapping
-      
-    # Ground truth matching
-    matching:
-      iou_threshold: 0.5  # IoU threshold for considering detection as correct
-      
   # Visualization settings
   visualization:
-    # What to visualize
-    generate_plots: true
-    save_detection_images: true  # Save images with predicted bounding boxes
-    plot_metrics: true  # Generate metric plots
-    plot_confusion_matrix: true
-    plot_roc_curve: true
+    enabled: true  # Whether to generate visualizations
     
     # Plot styling
     figure_size: [12, 8]  # Default figure size (width, height)
-    dpi: 150  # Image resolution for saved plots
+    dpi: 300  # Image resolution for saved plots
     
-    # Colors for visualization
-    colors:
-      true_positive: "green"
-      false_positive: "red" 
-      false_negative: "orange"
-      ground_truth: "blue"
+  # Detection parameters
+  detection:
+    threshold: 0.0  # SVM decision boundary
+    iou_threshold: 0.5  # IoU threshold for NMS
 
 # System Configuration
 system:

@@ -31,6 +31,9 @@ colorlog>=6.6.0
 jupyter>=1.0.0
 ipykernel>=6.0.0
 
+# Hyperparameter optimization (optional)
+optuna>=3.0.0
+
 # Testing (optional)
 pytest>=6.2.0
 pytest-cov>=3.0.0

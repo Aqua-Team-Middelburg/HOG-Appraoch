@@ -239,7 +239,7 @@ class NurdleDetectionPipeline:
     
     def run_step_training(self) -> Dict[str, Any]:
         """
-        Step 5: Train SVM models on extracted features.
+        Step 5: Train SVM models on extracted features with comprehensive optimization.
         
         Returns:
             Results dictionary from model training
@@ -249,70 +249,75 @@ class NurdleDetectionPipeline:
         logger.info("=" * 60)
         
         try:
-            from sklearn.svm import SVC
-            from sklearn.preprocessing import StandardScaler
-            from sklearn.model_selection import cross_val_score
-            import joblib
             import numpy as np
+            from .src.training import SVMTrainer
             
-            # Load features
+            # Initialize SVM trainer
+            trainer = SVMTrainer(self.config)
+            
+            # Load extracted features
             features_dir = Path(self.config.get('paths.extracted_features_dir', 'temp/extracted_features'))
-            models_dir = Path(self.config.get('paths.output_dir')) / self.config.get('paths.models_dir')
             
-            # Get SVM configuration
-            svm_config = self.config.get_section('training').get('svm', {})
+            # Prepare feature data
+            feature_data = {}
             
-            results = {'trained_models': {}}
-            
-            # Train models for each feature type
             for feature_type in ['hog', 'lbp', 'combined']:
                 feature_file = features_dir / f'{feature_type}_features.npy'
                 labels_file = features_dir / f'{feature_type}_labels.npy'
                 
                 if feature_file.exists() and labels_file.exists():
-                    logger.info(f"Training {feature_type} model...")
+                    logger.info(f"Loading {feature_type} features from {feature_file}")
                     
-                    # Load data
                     features = np.load(feature_file)
                     labels = np.load(labels_file)
                     
-                    # Scale features
-                    scaler = StandardScaler()
-                    scaled_features = scaler.fit_transform(features)
-                    
-                    # Train SVM
-                    svm = SVC(
-                        kernel=svm_config.get('kernel', 'linear'),
-                        C=svm_config.get('C', 1.0),
-                        random_state=svm_config.get('random_state', 42)
-                    )
-                    svm.fit(scaled_features, labels)
-                    
-                    # Cross-validation
-                    cv_scores = cross_val_score(svm, scaled_features, labels, cv=5, scoring='f1')
-                    
-                    # Save model and scaler
-                    model_data = {
-                        'model': svm,
-                        'scaler': scaler,
-                        'feature_type': feature_type,
-                        'cv_scores': cv_scores,
-                        'config': svm_config
+                    feature_data[feature_type] = {
+                        'features': features,
+                        'labels': labels
                     }
                     
-                    model_filename = f'svm_{feature_type}_model.pkl'
-                    joblib.dump(model_data, models_dir / model_filename)
-                    
-                    results['trained_models'][feature_type] = {
-                        'cv_mean': float(np.mean(cv_scores)),
-                        'cv_std': float(np.std(cv_scores)),
-                        'model_file': model_filename,
-                        'feature_shape': features.shape
-                    }
-                    
-                    logger.info(f"{feature_type} model trained - CV F1: {np.mean(cv_scores):.3f} ± {np.std(cv_scores):.3f}")
+                    logger.info(f"Loaded {feature_type}: {features.shape} features, {len(labels)} labels")
+                else:
+                    logger.warning(f"Features not found for {feature_type}")
             
-            logger.info(f"Training completed: {len(results['trained_models'])} models trained")
+            if not feature_data:
+                raise ValueError("No feature data found for training")
+            
+            # Train all models (HOG, LBP, Combined, Stacking)
+            logger.info("Starting comprehensive model training...")
+            training_results = trainer.train_all_models(feature_data)
+            
+            # Generate training summary
+            model_summary = trainer.get_model_summary()
+            
+            results = {
+                'training_results': training_results,
+                'model_summary': model_summary,
+                'feature_data_shapes': {
+                    ft: data['features'].shape 
+                    for ft, data in feature_data.items()
+                },
+                'models_directory': str(trainer.models_dir),
+                'trained_model_types': list(training_results.keys())
+            }
+            
+            # Log summary
+            logger.info("=" * 40)
+            logger.info("TRAINING SUMMARY")
+            logger.info("=" * 40)
+            
+            successful_models = 0
+            for model_type, result in training_results.items():
+                if 'error' not in result:
+                    cv_mean = result.get('cv_mean', 0)
+                    cv_std = result.get('cv_std', 0)
+                    logger.info(f"✅ {model_type}: F1 = {cv_mean:.4f} ± {cv_std:.4f}")
+                    successful_models += 1
+                else:
+                    logger.error(f"❌ {model_type}: {result['error']}")
+            
+            logger.info(f"Training completed: {successful_models}/{len(training_results)} models successful")
+            
             return results
             
         except Exception as e:
@@ -322,7 +327,7 @@ class NurdleDetectionPipeline:
     
     def run_step_evaluation(self) -> Dict[str, Any]:
         """
-        Step 6: Evaluate trained models and generate reports.
+        Step 6: Evaluate trained models with comprehensive metrics and visualizations.
         
         Returns:
             Results dictionary from evaluation
@@ -332,20 +337,155 @@ class NurdleDetectionPipeline:
         logger.info("=" * 60)
         
         try:
-            # This would implement comprehensive evaluation
-            # For now, return basic evaluation results
+            import numpy as np
+            from .src.training import SVMTrainer
+            from .src.evaluation import ModelEvaluator
+            
+            # Initialize evaluator
+            evaluator = ModelEvaluator(self.config)
+            
+            # Initialize trainer to load models
+            trainer = SVMTrainer(self.config)
+            
+            # Load trained models
+            models_dir = trainer.models_dir
+            model_files = list(models_dir.glob('svm_*_model_*.pkl'))
+            
+            if not model_files:
+                logger.warning("No trained models found for evaluation")
+                return {'error': 'No trained models found', 'models_directory': str(models_dir)}
+            
+            # Load most recent models
+            loaded_models = {}
+            for model_file in model_files:
+                try:
+                    model_package = trainer.load_model(str(model_file))
+                    feature_type = model_package['feature_type']
+                    loaded_models[feature_type] = model_package
+                    logger.info(f"Loaded {feature_type} model from {model_file.name}")
+                except Exception as e:
+                    logger.error(f"Failed to load model {model_file.name}: {e}")
+            
+            if not loaded_models:
+                raise ValueError("Failed to load any trained models")
+            
+            # Prepare test data (using a portion of training data for evaluation)
+            # In a real scenario, you would have separate test sets
+            features_dir = Path(self.config.get('paths.extracted_features_dir', 'temp/extracted_features'))
+            
+            # Create test sets from available data
+            test_data = {}
+            test_split_ratio = self.config.get_section('evaluation').get('test_split_ratio', 0.2)
+            
+            for feature_type in loaded_models.keys():
+                feature_file = features_dir / f'{feature_type}_features.npy'
+                labels_file = features_dir / f'{feature_type}_labels.npy'
+                
+                if feature_file.exists() and labels_file.exists():
+                    features = np.load(feature_file)
+                    labels = np.load(labels_file)
+                    
+                    # Simple train/test split (last 20% for testing)
+                    n_samples = len(features)
+                    n_test = int(n_samples * test_split_ratio)
+                    
+                    if n_test > 0:
+                        test_features = features[-n_test:]
+                        test_labels = labels[-n_test:]
+                        
+                        test_data[feature_type] = {
+                            'features': test_features,
+                            'labels': test_labels
+                        }
+                        
+                        logger.info(f"Created test set for {feature_type}: {test_features.shape}")
+            
+            # Evaluate each model
+            evaluation_results = {}
+            
+            for model_name, model_package in loaded_models.items():
+                if model_name in test_data:
+                    logger.info(f"Evaluating {model_name} model...")
+                    
+                    test_features = test_data[model_name]['features']
+                    test_labels = test_data[model_name]['labels']
+                    
+                    # Perform evaluation
+                    eval_result = evaluator.evaluate_single_model(
+                        model_package, test_features, test_labels, model_name
+                    )
+                    evaluation_results[model_name] = eval_result
+                    
+                    # Log key metrics
+                    metrics = eval_result['metrics']
+                    logger.info(f"{model_name} Results:")
+                    logger.info(f"  Accuracy: {metrics.get('accuracy', 0):.4f}")
+                    logger.info(f"  Precision: {metrics.get('precision', 0):.4f}")
+                    logger.info(f"  Recall: {metrics.get('recall', 0):.4f}")
+                    logger.info(f"  F1-Score: {metrics.get('f1_score', 0):.4f}")
+                    if metrics.get('roc_auc'):
+                        logger.info(f"  ROC AUC: {metrics['roc_auc']:.4f}")
+            
+            # Generate model comparison
+            if len(evaluation_results) > 1:
+                logger.info("Generating model comparison...")
+                comparison_results = evaluator.compare_models(evaluation_results)
+            else:
+                comparison_results = {}
+            
+            # Generate image-level evaluation (simulated)
+            logger.info("Calculating image-level performance...")
+            image_level_results = evaluator.evaluate_image_level_performance(evaluation_results)
+            
+            # Create visualizations
+            logger.info("Creating evaluation visualizations...")
+            visualization_paths = evaluator.create_visualizations(evaluation_results)
+            
+            # Generate summary statistics
+            summary_stats = evaluator.generate_summary_statistics(evaluation_results)
+            
+            # Save comprehensive evaluation report
+            report_path = evaluator.save_evaluation_report(
+                evaluation_results, 
+                image_level_results, 
+                visualization_paths
+            )
+            
+            # Compile final results
             results = {
-                'evaluation_completed': True,
-                'models_evaluated': ['hog', 'lbp', 'combined'],
-                'metrics_calculated': ['precision', 'recall', 'f1', 'accuracy'],
-                'output_directory': str(Path(self.config.get('paths.output_dir')) / self.config.get('paths.evaluations_dir'))
+                'evaluation_results': evaluation_results,
+                'model_comparison': comparison_results,
+                'image_level_results': image_level_results,
+                'summary_statistics': summary_stats,
+                'visualization_paths': visualization_paths,
+                'evaluation_report': report_path,
+                'models_evaluated': list(evaluation_results.keys()),
+                'test_samples_per_model': {
+                    model: len(test_data[model]['labels'])
+                    for model in evaluation_results.keys()
+                    if model in test_data
+                }
             }
             
-            logger.info("Evaluation completed - detailed implementation pending")
+            # Log final summary
+            logger.info("=" * 40)
+            logger.info("EVALUATION SUMMARY")
+            logger.info("=" * 40)
+            
+            if comparison_results.get('model_ranking'):
+                logger.info("Model Ranking (by overall score):")
+                for i, model in enumerate(comparison_results['model_ranking'], 1):
+                    logger.info(f"  {i}. {model}")
+            
+            logger.info(f"Generated {len(visualization_paths)} visualizations")
+            logger.info(f"Evaluation report saved: {report_path}")
+            logger.info("Evaluation completed successfully!")
+            
             return results
             
         except Exception as e:
             logger.error(f"Evaluation failed: {e}")
+            logger.error(traceback.format_exc())
             raise
     
     def run_full_pipeline(self) -> Dict[str, Any]:
@@ -498,6 +638,11 @@ Examples:
     )
     
     parser.add_argument(
+        '--steps',
+        help='Run specific pipeline steps (comma-separated list: normalize,sliding_window,feature_extraction,training,evaluation)'
+    )
+    
+    parser.add_argument(
         '--evaluate-only',
         action='store_true',
         help='Run only the evaluation step (requires trained models)'
@@ -536,6 +681,30 @@ Examples:
             results = pipeline.run_single_step('evaluation')
         elif args.step:
             results = pipeline.run_single_step(args.step)
+        elif args.steps:
+            # Parse comma-separated steps
+            step_names = [s.strip() for s in args.steps.split(',')]
+            
+            # Map step names to internal names
+            step_mapping = {
+                'normalize': 'normalization',
+                'normalization': 'normalization',
+                'sliding_window': 'sliding_window',
+                'feature_extraction': 'feature_extraction',
+                'training': 'training',
+                'evaluation': 'evaluation'
+            }
+            
+            # Run specified steps in order
+            results = {}
+            for step_name in step_names:
+                internal_step = step_mapping.get(step_name, step_name)
+                if internal_step:  # Ensure not None
+                    logger.info(f"Running step: {step_name} -> {internal_step}")
+                    step_result = pipeline.run_single_step(internal_step)
+                    results[internal_step] = step_result
+                else:
+                    logger.warning(f"Unknown step: {step_name}")
         else:
             results = pipeline.run_full_pipeline()
         

@@ -424,12 +424,12 @@ class SlidingWindowProcessor:
         
         logger.info(f"Saved {len(positive_windows)} positive and {len(negative_windows)} negative windows")
     
-    def load_processed_windows(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def load_processed_windows(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Load previously processed training windows.
         
         Returns:
-            Tuple of (positive_windows, negative_windows, labels)
+            Tuple of (positive_windows, negative_windows, all_windows, labels)
         """
         positive_path = self.candidate_dir / 'processed_windows_positive.npy'
         negative_path = self.candidate_dir / 'processed_windows_negative.npy'

@@ -7,6 +7,7 @@ while maintaining aspect ratios and updating corresponding JSON annotations.
 
 import os
 import json
+import copy
 import shutil
 from PIL import Image
 from pathlib import Path
@@ -153,7 +154,7 @@ class ImageNormalizer:
             Updated JSON data with scaled coordinates
         """
         # Create a copy to avoid modifying original
-        scaled_data = json.deepcopy(json_data) if hasattr(json, 'deepcopy') else json.loads(json.dumps(json_data))
+        scaled_data = copy.deepcopy(json_data)
         
         # Update image dimensions
         if 'image' in scaled_data:
