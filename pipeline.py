@@ -23,19 +23,29 @@ import traceback
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-# Import pipeline components
-from src.utils.config import ConfigLoader
-from src.preprocessing.normalizer import ImageNormalizer
-from src.preprocessing.window_processor import SlidingWindowProcessor
-from src.feature_extraction.combined_extractor import CombinedFeatureExtractor
+# Import pipeline components with error handling
+try:
+    from src.utils.config import ConfigLoader
+    from src.preprocessing.normalizer import ImageNormalizer
+    from src.preprocessing.window_processor import SlidingWindowProcessor
+    from src.feature_extraction.combined_extractor import CombinedFeatureExtractor
+except ImportError as e:
+    print(f"Error importing pipeline components: {e}")
+    print("Make sure you're running from the HOG_Pipeline_App directory")
+    print("Try: cd HOG_Pipeline_App && python pipeline.py --config config.yaml")
+    sys.exit(1)
 
 # Configure logging
+# Create logs directory if it doesn't exist
+logs_dir = Path('output/logs')
+logs_dir.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('output/logs/pipeline.log')
+        logging.FileHandler(logs_dir / 'pipeline.log')
     ]
 )
 
@@ -250,7 +260,7 @@ class NurdleDetectionPipeline:
         
         try:
             import numpy as np
-            from .src.training import SVMTrainer
+            from src.training import SVMTrainer
             
             # Initialize SVM trainer
             trainer = SVMTrainer(self.config)
@@ -338,8 +348,8 @@ class NurdleDetectionPipeline:
         
         try:
             import numpy as np
-            from .src.training import SVMTrainer
-            from .src.evaluation import ModelEvaluator
+            from src.training import SVMTrainer
+            from src.evaluation import ModelEvaluator
             
             # Initialize evaluator
             evaluator = ModelEvaluator(self.config)

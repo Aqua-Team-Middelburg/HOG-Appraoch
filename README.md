@@ -4,39 +4,31 @@ A comprehensive machine learning pipeline for detecting nurdles (plastic pellets
 
 ## 🚀 Quick Start
 
-### Option 1: Run Online (Recommended for Large Models) 
-
-**GitHub Actions** - Run the pipeline in the cloud without local setup:
-
-1. **Fork/Clone the Repository**
-2. **Go to GitHub Actions tab** in your repository
-3. **Select "HOG/LBP/SVM Pipeline Training"** workflow
-4. **Click "Run workflow"** and choose your options:
-   - Pipeline steps: `normalize,sliding_window,feature_extraction,training,evaluation`
-   - Enable/disable specific steps as needed
-5. **Monitor progress** in the Actions tab
-6. **Download artifacts** when complete (models, visualizations, logs)
-
-**Benefits of online execution:**
-- ✅ No local environment setup required
-- ✅ Handle large datasets and models without local storage limits  
-- ✅ Parallel execution across Python versions
-- ✅ Automatic artifact storage and download
-- ✅ Detailed execution logs and summaries
-
-### Option 2: Local Setup
+### 1. Setup
 
 ```bash
 # Clone the repository
 git clone https://github.com/Aqua-Team-Middelburg/HOG-Approach.git
 cd HOG-Approach/HOG_Pipeline_App
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Test setup
-python test_dependencies.py
+# One-command setup (installs dependencies and creates directories)
+python setup.py
 ```
+
+### Online Code Editors (Recommended)
+
+This pipeline works great in **GitHub Codespaces**, **Google Colab**, **Replit**, or any online Python environment:
+
+1. **Open in your preferred online editor**
+2. **Run setup**: `python setup.py` 
+3. **Start training**: `python pipeline.py --config config.yaml`
+
+**Benefits:**
+- ✅ No local environment setup required
+- ✅ Access to cloud compute resources  
+- ✅ Works on any machine with Python
+- ✅ Easy sharing and collaboration
+- ✅ No virtual environment conflicts
 
 ### 2. Prepare Your Data
 
