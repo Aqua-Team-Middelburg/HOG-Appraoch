@@ -74,6 +74,11 @@ preprocessing:
     window_size: [40, 40]  # Size of sliding window
     stride: 20  # Step size between windows (smaller = more overlap)
     
+    # Separate stride for training vs inference (Phase 3.2 optimization)
+    stride_train: 30  # Larger stride for training = fewer windows, faster
+    stride_inference: 15  # Smaller stride for inference = better coverage
+    use_separate_strides: false  # Enable to use stride_train/stride_inference
+    
     # Boundary handling
     pad_image: true  # Whether to pad image to ensure full coverage
     min_window_coverage: 0.8  # Minimum fraction of window that must be inside image
@@ -112,6 +117,23 @@ features:
   # LBP: 10 dimensions (grayscale)
   # Combined grayscale: 91 dimensions
   # Combined RGB: 253 dimensions
+  
+  # Dimensionality Reduction (Phase 3.3)
+  dimensionality_reduction:
+    enabled: false  # Enable PCA to reduce feature dimensions
+    method: "pca"  # Only "pca" supported currently
+    
+    # PCA configuration
+    pca:
+      n_components: "auto"  # "auto", integer, or float (variance ratio)
+      variance_threshold: 0.95  # If "auto", retain 95% of variance
+      whiten: false  # Whether to whiten (normalize) PCA components
+      
+    # Manual target dimensions (optional - overrides n_components)
+    target_dimensions:
+      hog: 50  # Reduce HOG from 81/243 to 50 dimensions
+      lbp: null  # null = keep original (LBP already small)
+      combined: 80  # Target for combined features
 
 # Model Training Configuration
 training:
@@ -144,6 +166,29 @@ training:
     
     # Iterations (for future enhancement)
     mining_iterations: 1  # Number of hard negative mining iterations
+  
+  # Bounding Box Regression (Phase 2.1)
+  bounding_box_regression:
+    enabled: false  # Enable bbox refinement after classification
+    
+    # Regression model type
+    regressor_type: "svr"  # "svr" (Support Vector Regression) or "ridge" (Ridge Regression)
+    
+    # SVR parameters (used if regressor_type="svr")
+    kernel: "linear"  # "linear", "rbf", "poly"
+    C: 1.0  # Regularization parameter
+    epsilon: 0.1  # Epsilon-tube for SVR
+    
+    # Ridge parameters (used if regressor_type="ridge")
+    alpha: 1.0  # L2 regularization strength
+    
+    # Target normalization
+    normalize_targets: true  # Normalize regression targets (recommended)
+    clip_targets: true  # Clip targets to valid ranges
+    max_offset_ratio: 0.5  # Maximum offset as fraction of window size
+    
+    # Multi-output handling
+    independent_outputs: true  # Train separate regressor for each output dimension
   
   # Support Vector Machine (SVM) parameters
   svm:
@@ -218,6 +263,28 @@ evaluation:
     optimize_threshold: true  # Whether to optimize detection threshold
     threshold_optimization_metric: "f1"  # Metric for threshold optimization
 
+# Multi-Scale Detection Configuration (Phase 2.2)
+multi_scale_detection:
+  # Image pyramid parameters
+  pyramid:
+    enabled: false  # Enable multi-scale detection via image pyramids
+    
+    # Pyramid generation
+    scale_factor: 1.5  # Downsampling factor between levels (e.g., 1.5 = 67% of previous)
+    min_size: [40, 40]  # Minimum image size (width, height) for pyramid levels
+    max_levels: 5  # Maximum number of pyramid levels
+    
+    # Interpolation method for resizing
+    # Options: "nearest", "linear", "cubic", "area", "lanczos"
+    interpolation: "linear"
+  
+  # Scale-aware NMS parameters
+  nms:
+    enabled: false  # Use scale-aware NMS instead of standard NMS
+    iou_threshold: 0.5  # IoU threshold for cross-scale suppression
+    scale_penalty: 0.1  # Score penalty for coarser scales (0.0-1.0)
+    # Higher penalty favors detections from finer (original-size) scales
+
 # System Configuration
 system:
   # Logging configuration
@@ -232,7 +299,23 @@ system:
     # Parallel processing
     n_jobs: -1  # Number of parallel jobs (-1 for all cores, 1 for no parallelism)
     
-    # Memory management
+    # Memory management (Phase 3.1)
+    batch_processing:
+      enabled: false  # Use generators for memory efficiency (large datasets)
+      batch_size: 1000  # Windows per batch
+      
+    # Incremental training (Phase 3.1)
+    incremental_training:
+      enabled: false  # Use SGDClassifier instead of LinearSVC
+      partial_fit_batch_size: 5000  # Samples per partial_fit call
+      n_epochs: 5  # Number of passes over data
+      learning_rate: "optimal"  # "constant", "optimal", "invscaling", "adaptive"
+      
+    # Feature caching
+    cache_features_to_disk: false  # Save features to disk for large datasets
+    feature_cache_dir: "temp/feature_cache"
+    
+    # Memory limits
     batch_size: 1000  # Batch size for processing large datasets
     memory_limit_gb: 8  # Memory limit in GB (for monitoring)
     

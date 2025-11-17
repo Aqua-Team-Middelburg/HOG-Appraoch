@@ -23,6 +23,7 @@ from sklearn.metrics import (
 )
 
 from ..utils.config import ConfigLoader
+from ..training.bbox_regressor import BoundingBoxRegressor
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +238,77 @@ class NonMaximumSuppression:
                 # else: detection is suppressed (too much overlap)
             
             detections = remaining
+        
+        return kept_detections
+    
+    @staticmethod
+    def apply_nms_multi_scale(detections: List[Dict[str, Any]], 
+                             iou_threshold: float = 0.5,
+                             scale_penalty: float = 0.1) -> List[Dict[str, Any]]:
+        """
+        Apply scale-aware Non-Maximum Suppression for multi-scale detections.
+        
+        This method performs NMS across detections from different pyramid scales,
+        with optional scale penalty to favor detections from finer (larger) scales.
+        
+        Args:
+            detections: List of detection dicts with 'bbox', 'score', 'label', 'scale'
+            iou_threshold: IoU threshold for suppression
+            scale_penalty: Score penalty for coarser scales (0=no penalty, 1=strong)
+            
+        Returns:
+            Filtered list of detections after scale-aware NMS
+        """
+        if not detections:
+            return []
+        
+        # Apply scale penalty to scores
+        adjusted_detections = []
+        for det in detections:
+            det_copy = det.copy()
+            
+            # Scale penalty: coarser scales (smaller scale values) get lower scores
+            # scale=1.0 (original) gets no penalty
+            # scale=0.67 (first downsample with factor 1.5) gets small penalty
+            scale = det.get('scale', 1.0)
+            scale_adjustment = 1.0 - (scale_penalty * (1.0 - scale))
+            
+            det_copy['adjusted_score'] = det_copy['score'] * scale_adjustment
+            det_copy['original_score'] = det_copy['score']
+            
+            adjusted_detections.append(det_copy)
+        
+        # Sort by adjusted scores (highest first)
+        adjusted_detections = sorted(adjusted_detections, 
+                                     key=lambda x: x['adjusted_score'], 
+                                     reverse=True)
+        
+        kept_detections = []
+        
+        while adjusted_detections:
+            # Keep highest scoring detection
+            current = adjusted_detections.pop(0)
+            kept_detections.append(current)
+            
+            # Remove overlapping detections from all scales
+            remaining = []
+            for detection in adjusted_detections:
+                iou = NonMaximumSuppression.calculate_iou(
+                    current['bbox'],
+                    detection['bbox']
+                )
+                
+                if iou <= iou_threshold:
+                    remaining.append(detection)
+                # else: suppressed due to overlap
+            
+            adjusted_detections = remaining
+        
+        # Restore original scores in output
+        for det in kept_detections:
+            det['score'] = det['original_score']
+            del det['adjusted_score']
+            del det['original_score']
         
         return kept_detections
 
@@ -525,15 +597,98 @@ class ModelEvaluator:
         """
         return float(np.mean(np.abs(y_true - y_pred)))
     
+    def _apply_bbox_refinement(self,
+                              detections: List[Dict[str, Any]],
+                              features: np.ndarray,
+                              bbox_regressor: Optional[BoundingBoxRegressor],
+                              confidence_threshold: float = 0.5) -> List[Dict[str, Any]]:
+        """
+        Apply bounding box regression to refine detection windows.
+        
+        Uses trained regressor to predict offset and scale adjustments,
+        transforming crude sliding window detections into tight-fitting boxes.
+        
+        Args:
+            detections: List of detection dicts with 'bbox', 'score', 'window_idx'
+            features: Feature vectors for all windows (N × D)
+            bbox_regressor: Trained BoundingBoxRegressor instance (or None)
+            confidence_threshold: Minimum confidence to apply refinement
+            
+        Returns:
+            List of detections with refined 'bbox' coordinates
+        """
+        if bbox_regressor is None or bbox_regressor.regressor is None:
+            logger.debug("No trained bbox regressor - skipping refinement")
+            return detections
+        
+        if not detections:
+            return detections
+        
+        logger.info(f"Applying bbox refinement to {len(detections)} detections")
+        
+        # Extract window indices and features for detections
+        detection_indices = [det.get('window_idx', -1) for det in detections]
+        
+        # Filter out detections without window indices
+        valid_detections = []
+        valid_indices = []
+        for det, idx in zip(detections, detection_indices):
+            if idx >= 0 and idx < len(features):
+                valid_detections.append(det)
+                valid_indices.append(idx)
+        
+        if not valid_detections:
+            logger.warning("No valid window indices for bbox refinement")
+            return detections
+        
+        # Get features for valid detections
+        detection_features = features[valid_indices]
+        
+        # Prepare detection list for regressor
+        detection_list = [
+            {
+                'bbox': det['bbox'],
+                'score': det['score'],
+                'label': det.get('label', det.get('prediction', 1))
+            }
+            for det in valid_detections
+        ]
+        
+        # Apply refinement
+        try:
+            refined_detections = bbox_regressor.refine_detections(
+                detection_list,
+                detection_features,
+                min_confidence=confidence_threshold
+            )
+            
+            # Update original detection bboxes
+            for i, refined_det in enumerate(refined_detections):
+                valid_detections[i]['bbox'] = refined_det['bbox']
+                valid_detections[i]['refined'] = True
+            
+            logger.info(f"Successfully refined {len(refined_detections)} bounding boxes")
+            
+        except Exception as e:
+            logger.error(f"Bbox refinement failed: {e}")
+            # Return original detections on error
+            return detections
+        
+        return valid_detections
+    
     def evaluate_image_level_performance(self,
                                        model_results: Dict[str, Dict[str, Any]],
-                                       window_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+                                       window_metadata: Optional[Dict[str, Any]] = None,
+                                       bbox_regressors: Optional[Dict[str, BoundingBoxRegressor]] = None,
+                                       test_features: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, Dict[str, Any]]:
         """
         Evaluate performance at image level by aggregating window predictions with NMS.
         
         Args:
             model_results: Results from window-level evaluation
             window_metadata: Window-to-image mapping metadata
+            bbox_regressors: Optional dict of bbox regressors by feature type
+            test_features: Optional dict of test features by feature type
             
         Returns:
             Image-level evaluation results with proper aggregation
@@ -601,16 +756,31 @@ class ModelEvaluator:
             image_counts_true = []
             
             for image_id, detections in image_groups.items():
-                # Apply NMS to predicted detections
+                # Prepare positive detections
                 positive_detections = [
                     {
                         'bbox': det['bbox'],
                         'score': float(det['score']),
-                        'label': int(det['prediction'])
+                        'label': int(det['prediction']),
+                        'window_idx': det['window_index']
                     }
                     for det in detections if det['prediction'] == 1
                 ]
                 
+                # Apply bbox refinement if regressor available
+                if bbox_regressors and feature_type in bbox_regressors:
+                    if test_features and feature_type in test_features:
+                        bbox_regressor = bbox_regressors[feature_type]
+                        features = test_features[feature_type]
+                        
+                        positive_detections = self._apply_bbox_refinement(
+                            positive_detections,
+                            features,
+                            bbox_regressor,
+                            confidence_threshold=0.5
+                        )
+                
+                # Apply NMS to detections (potentially refined)
                 filtered_detections = self.nms.apply_nms(positive_detections, nms_threshold)
                 
                 # Count predictions and ground truth

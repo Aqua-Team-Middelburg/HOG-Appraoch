@@ -16,6 +16,7 @@ from tqdm import tqdm
 import json
 
 from ..utils.config import ConfigLoader
+from .image_pyramid import ImagePyramid
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,12 @@ class SlidingWindowProcessor:
         sliding_config = config.get_section('preprocessing').get('sliding_window', {})
         self.window_size = tuple(sliding_config.get('window_size', [40, 40]))
         self.stride = sliding_config.get('stride', 20)
+        
+        # Separate stride for training vs inference (Phase 3.2 optimization)
+        self.use_separate_strides = sliding_config.get('use_separate_strides', False)
+        self.stride_train = sliding_config.get('stride_train', 30)
+        self.stride_inference = sliding_config.get('stride_inference', 15)
+        
         self.pad_image = sliding_config.get('pad_image', True)
         self.min_coverage = sliding_config.get('min_window_coverage', 0.8)
         
@@ -189,12 +196,33 @@ class SlidingWindowProcessor:
         
         return (x, y, self.gt_bbox_size, self.gt_bbox_size)
     
-    def extract_sliding_windows(self, image: np.ndarray) -> Generator[Tuple[np.ndarray, Tuple[int, int, int, int]], None, None]:
+    def _get_stride(self, mode: str = 'default') -> int:
+        """
+        Get stride value based on mode (training vs inference).
+        
+        Args:
+            mode: 'train', 'inference', or 'default'
+            
+        Returns:
+            Stride value
+        """
+        if not self.use_separate_strides:
+            return self.stride
+        
+        if mode == 'train':
+            return self.stride_train
+        elif mode == 'inference':
+            return self.stride_inference
+        else:
+            return self.stride
+    
+    def extract_sliding_windows(self, image: np.ndarray, mode: str = 'default') -> Generator[Tuple[np.ndarray, Tuple[int, int, int, int]], None, None]:
         """
         Extract sliding windows from an image.
         
         Args:
             image: Input image as numpy array
+            mode: 'train', 'inference', or 'default' (affects stride if separate strides enabled)
             
         Yields:
             Tuples of (window_image, bbox) where bbox is (x, y, width, height)
@@ -202,10 +230,13 @@ class SlidingWindowProcessor:
         height, width = image.shape[:2]
         window_w, window_h = self.window_size
         
+        # Get appropriate stride for mode
+        stride = self._get_stride(mode)
+        
         # Calculate padding if needed
         if self.pad_image:
-            pad_w = window_w - (width % self.stride) if width % self.stride != 0 else 0
-            pad_h = window_h - (height % self.stride) if height % self.stride != 0 else 0
+            pad_w = window_w - (width % stride) if width % stride != 0 else 0
+            pad_h = window_h - (height % stride) if height % stride != 0 else 0
             
             if pad_w > 0 or pad_h > 0:
                 if len(image.shape) == 3:
@@ -216,8 +247,8 @@ class SlidingWindowProcessor:
                 height, width = image.shape[:2]
         
         # Extract windows
-        for y in range(0, height - window_h + 1, self.stride):
-            for x in range(0, width - window_w + 1, self.stride):
+        for y in range(0, height - window_h + 1, stride):
+            for x in range(0, width - window_w + 1, stride):
                 window = image[y:y + window_h, x:x + window_w]
                 
                 # Check minimum coverage
@@ -369,7 +400,8 @@ class SlidingWindowProcessor:
         # Track which ground truth centers were captured
         centers_captured = set()
         
-        for window, bbox in self.extract_sliding_windows(image):
+        # Use training stride for training data
+        for window, bbox in self.extract_sliding_windows(image, mode='train'):
             is_positive = self.label_window(bbox, ground_truth_objects)
             
             window_data = {
@@ -443,7 +475,8 @@ class SlidingWindowProcessor:
         windows = []
         bboxes = []
         
-        for window, bbox in self.extract_sliding_windows(image):
+        # Use inference stride for detection
+        for window, bbox in self.extract_sliding_windows(image, mode='inference'):
             windows.append(window)
             bboxes.append(bbox)
         
@@ -457,6 +490,89 @@ class SlidingWindowProcessor:
         }
         
         logger.debug(f"Extracted {len(windows)} windows from {image_path.name}")
+        return results
+    
+    def process_image_multi_scale(self, image_path: Path, 
+                                  pyramid: Optional[ImagePyramid] = None) -> Dict[str, Any]:
+        """
+        Process image at multiple scales using image pyramids.
+        
+        Extracts candidate windows from each pyramid level, enabling detection
+        of objects at different scales. Window coordinates are mapped back to
+        original image coordinates.
+        
+        Args:
+            image_path: Path to the image file
+            pyramid: Optional ImagePyramid instance (creates new if None)
+            
+        Returns:
+            Dictionary containing windows from all scales with metadata
+        """
+        logger.debug(f"Processing {image_path.name} at multiple scales")
+        
+        # Load image
+        image = cv2.imread(str(image_path))
+        if image is None:
+            logger.error(f"Could not load image: {image_path}")
+            return {'success': False, 'error': 'Could not load image'}
+        
+        # Convert BGR to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Create pyramid if not provided
+        if pyramid is None:
+            pyramid = ImagePyramid(self.config)
+        
+        # Generate pyramid levels
+        pyramid_levels = pyramid.generate_pyramid(image)
+        
+        # Storage for multi-scale windows
+        all_windows = []
+        all_bboxes = []
+        all_scales = []
+        all_pyramid_levels = []
+        
+        # Process each pyramid level
+        for pyr_level in pyramid_levels:
+            # Extract windows from this scale
+            level_windows = []
+            level_bboxes = []
+            
+            for window, bbox in self.extract_sliding_windows(pyr_level.image):
+                # Map bbox coordinates back to original image
+                orig_bbox = pyramid.map_coordinates_to_original(
+                    bbox[0], bbox[1], bbox[2], bbox[3],
+                    pyr_level.scale
+                )
+                
+                level_windows.append(window)
+                level_bboxes.append(orig_bbox)  # Store in original coordinates
+            
+            # Append to all windows
+            all_windows.extend(level_windows)
+            all_bboxes.extend(level_bboxes)
+            all_scales.extend([pyr_level.scale] * len(level_windows))
+            all_pyramid_levels.extend([pyr_level.level] * len(level_windows))
+            
+            logger.debug(f"Level {pyr_level.level} (scale={pyr_level.scale:.3f}): "
+                        f"extracted {len(level_windows)} windows")
+        
+        results = {
+            'success': True,
+            'image_name': image_path.name,
+            'image_shape': image.shape,
+            'num_pyramid_levels': len(pyramid_levels),
+            'pyramid_scales': [level.scale for level in pyramid_levels],
+            'total_windows': len(all_windows),
+            'windows': all_windows,
+            'bboxes': all_bboxes,  # All in original image coordinates
+            'scales': all_scales,  # Which scale each window came from
+            'pyramid_levels': all_pyramid_levels  # Which pyramid level
+        }
+        
+        logger.info(f"Multi-scale processing: {len(all_windows)} windows from "
+                   f"{len(pyramid_levels)} pyramid levels for {image_path.name}")
+        
         return results
     
     def generate_balanced_training_dataset(self, positive_ratio: float = 0.3) -> Dict[str, Any]:
