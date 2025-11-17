@@ -21,7 +21,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 # Import pipeline components with error handling
 try:
@@ -84,6 +84,70 @@ class NurdleDetectionPipeline:
         
         logger.info("Pipeline initialized successfully")
     
+    def _load_bbox_regression_data(self) -> Tuple[List[Tuple[int, int, int, int]], List[Tuple[int, int, int, int]]]:
+        """
+        Load positive windows and ground truth bboxes for bbox regression training.
+        
+        Returns:
+            Tuple of (positive_windows, ground_truth_bboxes)
+        """
+        import json
+        import numpy as np
+        from pathlib import Path
+        
+        # Load window metadata from sliding window processing
+        candidate_dir = Path(self.config.get('paths.candidate_windows_dir', 'temp/candidate_windows'))
+        metadata_file = candidate_dir / 'window_metadata.json'
+        
+        positive_windows = []
+        gt_bboxes = []
+        
+        if metadata_file.exists():
+            # Load from saved metadata
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+            
+            for item in metadata:
+                if item.get('label') == 1:  # Positive windows
+                    window_bbox = tuple(item['window_bbox'])
+                    gt_bbox = tuple(item['gt_bbox'])
+                    positive_windows.append(window_bbox)
+                    gt_bboxes.append(gt_bbox)
+        
+        else:
+            # Fallback: load from raw annotations
+            logger.warning("No window metadata found, using fallback bbox generation")
+            input_dir = Path(self.config.get('paths.input_dir'))
+            
+            # Find JSON files
+            json_files = list(input_dir.glob('*.json'))
+            
+            for json_file in json_files[:10]:  # Limit for fallback
+                try:
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                    
+                    objects = data.get('objects', [])
+                    for obj in objects:
+                        # Create normalized ground truth bbox
+                        if 'center_x' in obj and 'center_y' in obj:
+                            center_x = obj['center_x']
+                            center_y = obj['center_y']
+                            size = 40  # Default window size
+                            
+                            window_bbox = (center_x - size//2, center_y - size//2, size, size)
+                            gt_bbox = window_bbox  # For fallback, use same as window
+                            
+                            positive_windows.append(window_bbox)
+                            gt_bboxes.append(gt_bbox)
+                            
+                except Exception as e:
+                    logger.error(f"Error loading {json_file}: {e}")
+                    continue
+        
+        logger.info(f"Loaded {len(positive_windows)} positive windows for bbox regression")
+        return positive_windows, gt_bboxes
+    
     def _setup_directories(self) -> None:
         """Create necessary output directories."""
         output_dir = Path(self.config.get('paths.output_dir'))
@@ -123,8 +187,21 @@ class NurdleDetectionPipeline:
             # Save results
             import json
             output_path = Path(self.config.get('paths.output_dir')) / 'logs' / 'normalization_results.json'
+            
+            # Convert results to JSON-serializable format
+            def make_serializable(obj):
+                if isinstance(obj, dict):
+                    # Convert tuple keys to strings
+                    return {str(k): make_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, (list, tuple)):
+                    return [make_serializable(item) for item in obj]
+                else:
+                    return obj
+            
+            serializable_results = make_serializable(results)
+            
             with open(output_path, 'w') as f:
-                json.dump(results, f, indent=2, default=str)
+                json.dump(serializable_results, f, indent=2, default=str)
             
             logger.info(f"Normalization completed: {results['successful_normalizations']} images processed")
             
@@ -152,19 +229,40 @@ class NurdleDetectionPipeline:
         logger.info("=" * 60)
         
         try:
-            # This would implement train/test splitting logic
-            # For now, we'll use all normalized data for training
+            # Implement proper train/test splitting logic
             normalized_dir = Path(self.config.get('paths.temp_dir')) / 'normalized_images'
             image_files = list(normalized_dir.glob('*.jpg'))
             
+            # Get split ratio from config or use default
+            split_config = self.config.get_section('training').get('data_split', {})
+            test_ratio = split_config.get('test_ratio', 0.2)  # Default 20% for testing
+            
+            # Calculate split sizes
+            total_images = len(image_files)
+            test_size = max(1, int(total_images * test_ratio))  # At least 1 test image
+            train_size = total_images - test_size
+            
+            # Store split information for other pipeline steps
+            self.train_data = {
+                'image_files': image_files[:train_size],
+                'size': train_size
+            }
+            self.test_data = {
+                'image_files': image_files[train_size:],
+                'size': test_size
+            }
+            
             results = {
-                'total_images': len(image_files),
-                'train_images': len(image_files),  # Using all for training in this simplified version
-                'test_images': 0,
-                'split_strategy': 'all_for_training'
+                'total_images': total_images,
+                'train_images': train_size,
+                'test_images': test_size,
+                'split_strategy': f'{test_ratio*100:.0f}% test split',
+                'train_files': [str(f) for f in self.train_data['image_files']],
+                'test_files': [str(f) for f in self.test_data['image_files']]
             }
             
             logger.info(f"Data split: {results['train_images']} training, {results['test_images']} testing")
+            logger.info(f"Split strategy: {results['split_strategy']}")
             return results
             
         except Exception as e:
@@ -209,8 +307,18 @@ class NurdleDetectionPipeline:
         logger.info("=" * 60)
         
         try:
-            # Load processed windows
-            positive_windows, negative_windows, all_windows, labels = self.window_processor.load_processed_windows()
+            # Check if processed windows exist, if not, generate them
+            try:
+                positive_windows, negative_windows, all_windows, labels = self.window_processor.load_processed_windows()
+                logger.info("Using existing processed windows")
+            except FileNotFoundError:
+                logger.info("Processed windows not found, generating sliding window dataset...")
+                # Generate sliding window dataset first
+                sliding_results = self.run_step_sliding_window()
+                logger.info(f"Generated {sliding_results.get('total_positive_windows', 0)} positive windows")
+                
+                # Now load the processed windows
+                positive_windows, negative_windows, all_windows, labels = self.window_processor.load_processed_windows()
             
             # Extract features for training
             feature_results = self.feature_extractor.extract_features_for_training(
@@ -313,12 +421,12 @@ class NurdleDetectionPipeline:
                 
                 if result:
                     training_results[feature_type] = result
-                    logger.info(f"✅ {feature_type} incremental training completed")
+                    logger.info(f"[SUCCESS] {feature_type} incremental training completed")
                 else:
-                    logger.warning(f"❌ {feature_type} incremental training failed")
+                    logger.warning(f"[FAIL] {feature_type} incremental training failed")
                     
             except Exception as e:
-                logger.error(f"❌ {feature_type} incremental training failed: {e}")
+                logger.error(f"[FAIL] {feature_type} incremental training failed: {e}")
                 training_results[feature_type] = {'error': str(e)}
         
         # Note: Stacking ensemble not supported with incremental training
@@ -355,7 +463,7 @@ class NurdleDetectionPipeline:
             incremental_enabled = performance_config.get('incremental_training', {}).get('enabled', False)
             
             if incremental_enabled:
-                logger.info("🔄 Incremental training enabled - using memory-efficient approach")
+                logger.info("[INCREMENTAL] Incremental training enabled - using memory-efficient approach")
                 return self._run_incremental_training(trainer)
             else:
                 logger.info("📊 Standard training - loading all features into memory")
@@ -392,18 +500,62 @@ class NurdleDetectionPipeline:
             logger.info("Starting comprehensive model training...")
             training_results = trainer.train_all_models(feature_data)
             
+            # Train bounding box regressors if enabled
+            bbox_config = self.config.get_section('training').get('bounding_box_regression', {})
+            bbox_results = {}
+            
+            if bbox_config.get('enabled', False):
+                logger.info("Training bounding box regressors...")
+                
+                # Load positive windows and ground truth for bbox regression
+                try:
+                    # Load window metadata needed for bbox regression training
+                    positive_windows, gt_bboxes = self._load_bbox_regression_data()
+                    
+                    for feature_type in ['hog', 'lbp', 'combined']:
+                        if feature_type in feature_data and feature_type in training_results:
+                            if 'error' not in training_results[feature_type]:
+                                try:
+                                    # Get positive features for this feature type
+                                    features = feature_data[feature_type]['features']
+                                    labels = feature_data[feature_type]['labels']
+                                    positive_features = features[labels == 1]
+                                    
+                                    if len(positive_features) > 0:
+                                        logger.info(f"Training {feature_type} bbox regressor...")
+                                        bbox_result = trainer.train_bbox_regressor(
+                                            positive_features,
+                                            positive_windows[:len(positive_features)],  # Match positive sample count
+                                            gt_bboxes[:len(positive_features)],
+                                            feature_type
+                                        )
+                                        bbox_results[feature_type] = bbox_result
+                                        logger.info(f"[SUCCESS] {feature_type} bbox regressor training completed")
+                                    else:
+                                        logger.warning(f"No positive samples for {feature_type} bbox regression")
+                                        
+                                except Exception as e:
+                                    logger.error(f"[FAIL] {feature_type} bbox regressor training failed: {e}")
+                                    bbox_results[feature_type] = {'error': str(e)}
+                
+                except Exception as e:
+                    logger.error(f"Failed to load bbox regression data: {e}")
+                    logger.info("Skipping bbox regression training")
+            
             # Generate training summary
             model_summary = trainer.get_model_summary()
             
             results = {
                 'training_results': training_results,
+                'bbox_regressor_results': bbox_results,
                 'model_summary': model_summary,
                 'feature_data_shapes': {
                     ft: data['features'].shape 
                     for ft, data in feature_data.items()
                 },
                 'models_directory': str(trainer.models_dir),
-                'trained_model_types': list(training_results.keys())
+                'trained_model_types': list(training_results.keys()),
+                'bbox_regressors_trained': list(bbox_results.keys()) if bbox_results else []
             }
             
             # Log summary
@@ -416,10 +568,10 @@ class NurdleDetectionPipeline:
                 if 'error' not in result:
                     cv_mean = result.get('cv_mean', 0)
                     cv_std = result.get('cv_std', 0)
-                    logger.info(f"✅ {model_type}: F1 = {cv_mean:.4f} ± {cv_std:.4f}")
+                    logger.info(f"[SUCCESS] {model_type}: F1 = {cv_mean:.4f} ± {cv_std:.4f}")
                     successful_models += 1
                 else:
-                    logger.error(f"❌ {model_type}: {result['error']}")
+                    logger.error(f"[FAIL] {model_type}: {result['error']}")
             
             logger.info(f"Training completed: {successful_models}/{len(training_results)} models successful")
             
@@ -474,6 +626,26 @@ class NurdleDetectionPipeline:
             if not loaded_models:
                 raise ValueError("Failed to load any trained models")
             
+            # Load bbox regressors if available
+            bbox_regressors = {}
+            bbox_files = list(models_dir.glob('bbox_regressor_*.pkl'))
+            
+            for bbox_file in bbox_files:
+                try:
+                    from src.training.bbox_regressor import BoundingBoxRegressor
+                    bbox_regressor = BoundingBoxRegressor(self.config)
+                    bbox_regressor.load(str(bbox_file))
+                    
+                    # Extract feature type from filename
+                    feature_type = bbox_file.stem.replace('bbox_regressor_', '')
+                    bbox_regressors[feature_type] = bbox_regressor
+                    logger.info(f"Loaded {feature_type} bbox regressor from {bbox_file.name}")
+                except Exception as e:
+                    logger.error(f"Failed to load bbox regressor {bbox_file.name}: {e}")
+            
+            if bbox_regressors:
+                logger.info(f"Loaded {len(bbox_regressors)} bbox regressors for evaluation")
+            
             # Load test set with proper metadata handling
             logger.info("Loading test set with enhanced metadata support...")
             test_set_info = evaluator.test_loader.load_test_set_features_and_metadata()
@@ -517,9 +689,11 @@ class NurdleDetectionPipeline:
             else:
                 comparison_results = {}
             
-            # Generate image-level evaluation with proper metadata
-            logger.info("Calculating image-level performance with NMS and proper aggregation...")
-            image_level_results = evaluator.evaluate_image_level_performance(evaluation_results, window_metadata)
+            # Generate image-level evaluation with proper metadata and bbox refinement
+            logger.info("Calculating image-level performance with NMS, bbox refinement, and proper aggregation...")
+            image_level_results = evaluator.evaluate_image_level_performance(
+                evaluation_results, window_metadata, bbox_regressors, test_data
+            )
             
             # Create visualizations
             logger.info("Creating evaluation visualizations...")
@@ -579,7 +753,7 @@ class NurdleDetectionPipeline:
         Returns:
             Complete results dictionary
         """
-        logger.info("🚀 Starting HOG/LBP/SVM Nurdle Detection Pipeline")
+        logger.info("[PIPELINE] Starting HOG/LBP/SVM Nurdle Detection Pipeline")
         logger.info(f"Configuration: {self.config_path}")
         
         pipeline_steps = self.config.get_section('pipeline').get('steps', {})
@@ -621,13 +795,13 @@ class NurdleDetectionPipeline:
             # Save complete results
             self._save_pipeline_results()
             
-            logger.info("🎉 Pipeline completed successfully!")
-            logger.info(f"⏱️  Total runtime: {self.results['pipeline_info']['total_runtime_formatted']}")
+            logger.info("[SUCCESS] Pipeline completed successfully!")
+            logger.info(f"[TIME] Total runtime: {self.results['pipeline_info']['total_runtime_formatted']}")
             
             return self.results
             
         except Exception as e:
-            logger.error(f"❌ Pipeline failed: {e}")
+            logger.error(f"[FAIL] Pipeline failed: {e}")
             logger.error(traceback.format_exc())
             
             self.results['pipeline_info'] = {
@@ -798,24 +972,24 @@ Examples:
         logger.info("=" * 60)
         
         if results.get('pipeline_info', {}).get('success', False):
-            logger.info("✅ Pipeline completed successfully!")
+            logger.info("[SUCCESS] Pipeline completed successfully!")
             
             if 'pipeline_info' in results:
                 info = results['pipeline_info']
-                logger.info(f"⏱️  Runtime: {info.get('total_runtime_formatted', 'N/A')}")
-                logger.info(f"📁 Results saved to: {pipeline.config.get('paths.output_dir')}")
+                logger.info(f"[TIME] Runtime: {info.get('total_runtime_formatted', 'N/A')}")
+                logger.info(f"[OUTPUT] Results saved to: {pipeline.config.get('paths.output_dir')}")
         else:
-            logger.error("❌ Pipeline completed with errors")
+            logger.error("[FAIL] Pipeline completed with errors")
         
         # Exit with appropriate code
         sys.exit(0 if results.get('pipeline_info', {}).get('success', False) else 1)
         
     except KeyboardInterrupt:
-        logger.info("\n🛑 Pipeline interrupted by user")
+        logger.info("\n[INTERRUPT] Pipeline interrupted by user")
         sys.exit(130)
         
     except Exception as e:
-        logger.error(f"\n💥 Pipeline failed with unexpected error: {e}")
+        logger.error(f"\n[ERROR] Pipeline failed with unexpected error: {e}")
         logger.error(traceback.format_exc())
         sys.exit(1)
 
