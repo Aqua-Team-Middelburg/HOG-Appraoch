@@ -88,6 +88,10 @@ features:
     block_norm: "L2-Hys"  # Block normalization method
     transform_sqrt: false  # Whether to apply power law compression
     
+    # Color feature extraction (Phase 1.2)
+    use_color: true  # Extract from RGB channels vs grayscale
+    color_space: "RGB"  # "RGB", "HSV", "LAB" (for future experimentation)
+    
   # Local Binary Pattern (LBP) parameters
   lbp:
     n_points: 8  # Number of sample points on circle
@@ -101,14 +105,45 @@ features:
     
     # Whether to normalize features before combining
     normalize_before_combine: false
+  
+  # Feature dimensions (for reference - auto-calculated)
+  # Grayscale HOG: ~81 dimensions
+  # RGB HOG: ~243 dimensions (81 × 3 channels)
+  # LBP: 10 dimensions (grayscale)
+  # Combined grayscale: 91 dimensions
+  # Combined RGB: 253 dimensions
 
 # Model Training Configuration
 training:
-  # IoU threshold for positive window labeling
+  # Window labeling method (Phase 1.1)
+  labeling_method: "center_point"  # "center_point" or "iou" (legacy)
+  
+  # Center-point labeling configuration (Phase 1.1)
+  center_point:
+    allow_multiple_centers: false  # If >1 center in window, still label positive?
+    center_tolerance_px: 0  # Pixels of tolerance around exact center
+  
+  # Legacy IoU threshold for positive window labeling (used if labeling_method="iou")
   iou_threshold: 0.5
   
   # Ground truth bounding box normalization size
   gt_bbox_size: 40
+  
+  # Hard Negative Mining (Phase 1.3)
+  hard_negative_mining:
+    enabled: true  # Enable two-stage training with hard negative mining
+    
+    # Stage 1: Initial training
+    initial_negative_ratio: 3.0  # Negatives per positive in initial training
+    initial_sample_method: "random"  # "random" or "stratified"
+    
+    # Stage 2: Hard negative collection
+    false_positive_threshold: 0.0  # SVM decision threshold for FP collection
+    max_hard_negatives: 10000  # Maximum hard negatives to collect
+    hard_negative_ratio: 2.0  # Hard negatives per positive in final training
+    
+    # Iterations (for future enhancement)
+    mining_iterations: 1  # Number of hard negative mining iterations
   
   # Support Vector Machine (SVM) parameters
   svm:

@@ -52,6 +52,12 @@ class SlidingWindowProcessor:
         self.iou_threshold = training_config.get('iou_threshold', 0.5)
         self.gt_bbox_size = training_config.get('gt_bbox_size', 40)
         
+        # Center-point labeling configuration
+        self.labeling_method = training_config.get('labeling_method', 'center_point')
+        center_point_config = training_config.get('center_point', {})
+        self.allow_multiple_centers = center_point_config.get('allow_multiple_centers', False)
+        self.center_tolerance_px = center_point_config.get('center_tolerance_px', 0)
+        
         # Paths
         self.normalized_dir = Path(config.get('paths.temp_dir')) / 'normalized_images'
         self.candidate_dir = Path(config.get('paths.candidate_windows_dir', 'temp/candidate_windows'))
@@ -69,6 +75,9 @@ class SlidingWindowProcessor:
     def calculate_iou(self, box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, int]) -> float:
         """
         Calculate Intersection over Union (IoU) between two bounding boxes.
+        
+        DEPRECATED: This method is kept for backward compatibility.
+        Use center-point labeling instead for better training data quality.
         
         Args:
             box1: First bounding box as (x, y, width, height)
@@ -100,6 +109,64 @@ class SlidingWindowProcessor:
             return 0.0
             
         return intersection / union
+    
+    def _calculate_nurdle_center(self, bbox: Dict[str, Any]) -> Tuple[int, int]:
+        """
+        Calculate the center point of a nurdle from its bounding box annotation.
+        
+        Args:
+            bbox: Ground truth bounding box dictionary
+            
+        Returns:
+            Tuple of (center_x, center_y) coordinates
+        """
+        # Try to get explicit center coordinates
+        if 'center_x' in bbox and 'center_y' in bbox:
+            return (int(bbox['center_x']), int(bbox['center_y']))
+        
+        # Calculate from bbox coordinates
+        if 'x' in bbox and 'y' in bbox:
+            x = bbox['x']
+            y = bbox['y']
+            width = bbox.get('width', self.gt_bbox_size)
+            height = bbox.get('height', self.gt_bbox_size)
+            
+            center_x = int(x + width / 2)
+            center_y = int(y + height / 2)
+            return (center_x, center_y)
+        
+        # Fallback: use radius if available
+        if 'radius' in bbox:
+            center_x = bbox.get('center_x', 0)
+            center_y = bbox.get('center_y', 0)
+            return (int(center_x), int(center_y))
+        
+        logger.warning(f"Could not calculate center for bbox: {bbox}")
+        return (0, 0)
+    
+    def _contains_center_point(self, window_bbox: Tuple[int, int, int, int], 
+                               center_point: Tuple[int, int]) -> bool:
+        """
+        Check if a window contains a ground truth center point.
+        
+        Args:
+            window_bbox: Window bounding box as (x, y, width, height)
+            center_point: Ground truth center as (center_x, center_y)
+            
+        Returns:
+            True if center point falls within window bounds (with tolerance)
+        """
+        win_x, win_y, win_w, win_h = window_bbox
+        center_x, center_y = center_point
+        
+        # Apply tolerance
+        tolerance = self.center_tolerance_px
+        
+        # Check if center is within window bounds (with tolerance)
+        x_in_bounds = (win_x - tolerance) <= center_x <= (win_x + win_w + tolerance)
+        y_in_bounds = (win_y - tolerance) <= center_y <= (win_y + win_h + tolerance)
+        
+        return x_in_bounds and y_in_bounds
     
     def normalize_ground_truth_bbox(self, bbox: Dict[str, Any]) -> Tuple[int, int, int, int]:
         """
@@ -179,7 +246,68 @@ class SlidingWindowProcessor:
     def label_window(self, window_bbox: Tuple[int, int, int, int], 
                     ground_truth_objects: List[Dict[str, Any]]) -> bool:
         """
-        Determine if a window is positive or negative based on IoU with ground truth.
+        Determine if a window is positive or negative based on ground truth.
+        
+        Uses center-point labeling by default (configurable to use IoU for legacy support).
+        
+        Args:
+            window_bbox: Window bounding box as (x, y, width, height)
+            ground_truth_objects: List of ground truth object annotations
+            
+        Returns:
+            True if positive window, False otherwise
+        """
+        if self.labeling_method == 'center_point':
+            return self._label_window_center_point(window_bbox, ground_truth_objects)
+        else:
+            # Legacy IoU-based labeling
+            return self._label_window_iou(window_bbox, ground_truth_objects)
+    
+    def _label_window_center_point(self, window_bbox: Tuple[int, int, int, int],
+                                   ground_truth_objects: List[Dict[str, Any]]) -> bool:
+        """
+        Label window as positive if it contains a ground truth center point.
+        
+        Args:
+            window_bbox: Window bounding box as (x, y, width, height)
+            ground_truth_objects: List of ground truth object annotations
+            
+        Returns:
+            True if window contains at least one ground truth center point
+        """
+        centers_found = 0
+        
+        for obj in ground_truth_objects:
+            # Get bounding box from object
+            if 'bbox' in obj:
+                bbox = obj['bbox']
+            else:
+                # Construct bbox from object attributes
+                bbox = obj
+            
+            # Calculate center point
+            center_point = self._calculate_nurdle_center(bbox)
+            
+            # Check if this window contains the center
+            if self._contains_center_point(window_bbox, center_point):
+                centers_found += 1
+                
+                # If we don't allow multiple centers and found one, return immediately
+                if not self.allow_multiple_centers:
+                    return True
+        
+        # If allowing multiple centers, return True if at least one found
+        if self.allow_multiple_centers and centers_found > 0:
+            if centers_found > 1:
+                logger.debug(f"Window contains {centers_found} nurdle centers")
+            return True
+        
+        return centers_found > 0
+    
+    def _label_window_iou(self, window_bbox: Tuple[int, int, int, int],
+                         ground_truth_objects: List[Dict[str, Any]]) -> bool:
+        """
+        Legacy IoU-based window labeling (kept for backward compatibility).
         
         Args:
             window_bbox: Window bounding box as (x, y, width, height)
@@ -238,6 +366,9 @@ class SlidingWindowProcessor:
         positive_windows = []
         negative_windows = []
         
+        # Track which ground truth centers were captured
+        centers_captured = set()
+        
         for window, bbox in self.extract_sliding_windows(image):
             is_positive = self.label_window(bbox, ground_truth_objects)
             
@@ -249,8 +380,21 @@ class SlidingWindowProcessor:
             
             if is_positive:
                 positive_windows.append(window_data)
+                
+                # Track which centers this window captured
+                if self.labeling_method == 'center_point':
+                    for idx, obj in enumerate(ground_truth_objects):
+                        bbox_data = obj.get('bbox', obj)
+                        center = self._calculate_nurdle_center(bbox_data)
+                        if self._contains_center_point(bbox, center):
+                            centers_captured.add(idx)
             else:
                 negative_windows.append(window_data)
+        
+        # Calculate capture statistics
+        total_ground_truth = len(ground_truth_objects)
+        captured_count = len(centers_captured)
+        capture_rate = (captured_count / total_ground_truth * 100) if total_ground_truth > 0 else 0
         
         results = {
             'success': True,
@@ -259,10 +403,19 @@ class SlidingWindowProcessor:
             'positive_windows': len(positive_windows),
             'negative_windows': len(negative_windows),
             'positive_data': positive_windows,
-            'negative_data': negative_windows
+            'negative_data': negative_windows,
+            'ground_truth_objects': total_ground_truth,
+            'centers_captured': captured_count,
+            'capture_rate': capture_rate,
+            'labeling_method': self.labeling_method
         }
         
-        logger.debug(f"Processed {image_path.name}: {len(positive_windows)} positive, {len(negative_windows)} negative windows")
+        if self.labeling_method == 'center_point':
+            logger.debug(f"Processed {image_path.name}: {len(positive_windows)} positive windows, "
+                        f"{captured_count}/{total_ground_truth} centers captured ({capture_rate:.1f}%)")
+        else:
+            logger.debug(f"Processed {image_path.name}: {len(positive_windows)} positive, {len(negative_windows)} negative windows")
+        
         return results
     
     def process_image_for_inference(self, image_path: Path) -> Dict[str, Any]:
@@ -391,7 +544,10 @@ class SlidingWindowProcessor:
         metadata = {
             'window_size': self.window_size,
             'stride': self.stride,
-            'iou_threshold': self.iou_threshold,
+            'labeling_method': self.labeling_method,
+            'iou_threshold': self.iou_threshold if self.labeling_method == 'iou' else None,
+            'center_tolerance_px': self.center_tolerance_px if self.labeling_method == 'center_point' else None,
+            'allow_multiple_centers': self.allow_multiple_centers if self.labeling_method == 'center_point' else None,
             'gt_bbox_size': self.gt_bbox_size,
             'positive_count': len(positive_windows),
             'negative_count': len(negative_windows)
@@ -422,7 +578,9 @@ class SlidingWindowProcessor:
         with open(self.candidate_dir / 'processing_stats.json', 'w') as f:
             json.dump(stats, f, indent=2)
         
-        logger.info(f"Saved {len(positive_windows)} positive and {len(negative_windows)} negative windows")
+        logger.info(f"Saved {len(positive_windows)} positive and {len(negative_windows)} negative windows "
+                   f"(labeling method: {self.labeling_method})")
+
     
     def load_processed_windows(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """

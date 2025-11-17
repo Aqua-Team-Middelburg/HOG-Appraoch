@@ -52,7 +52,8 @@ class CombinedFeatureExtractor:
         self.hog_normalizer = None
         self.lbp_normalizer = None
         
-        logger.info(f"Combined extractor initialized - HOG: {self.hog_size}, "
+        color_mode = "color (RGB)" if self.hog_extractor.use_color else "grayscale"
+        logger.info(f"Combined extractor initialized - HOG: {self.hog_size} ({color_mode}), "
                    f"LBP: {self.lbp_size}, Combined: {self.combined_size}")
     
     def extract_hog_features(self, windows: np.ndarray) -> np.ndarray:
@@ -103,6 +104,15 @@ class CombinedFeatureExtractor:
         hog_features = self.extract_hog_features(windows)
         lbp_features = self.extract_lbp_features(windows)
         
+        # Validate dimensions
+        if hog_features.shape[0] != lbp_features.shape[0]:
+            logger.error(f"Feature dimension mismatch: HOG has {hog_features.shape[0]} samples, "
+                        f"LBP has {lbp_features.shape[0]} samples")
+            # Use minimum number of samples
+            min_samples = min(hog_features.shape[0], lbp_features.shape[0])
+            hog_features = hog_features[:min_samples]
+            lbp_features = lbp_features[:min_samples]
+        
         # Normalize if requested
         if self.normalize_before_combine:
             if self.hog_normalizer is not None:
@@ -112,6 +122,14 @@ class CombinedFeatureExtractor:
         
         # Combine features
         combined_features = np.concatenate([hog_features, lbp_features], axis=1)
+        
+        # Validate combined dimensions
+        expected_size = self.combined_size
+        actual_size = combined_features.shape[1]
+        if actual_size != expected_size:
+            logger.warning(f"Combined feature size mismatch: expected {expected_size}, got {actual_size}")
+            # Update combined_size if this is the first extraction
+            self.combined_size = actual_size
         
         return combined_features
     

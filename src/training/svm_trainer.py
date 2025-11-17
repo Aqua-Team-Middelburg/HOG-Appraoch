@@ -57,6 +57,10 @@ class SVMTrainer:
         self.tuning_config = training_config.get('hyperparameter_tuning', {})
         self.ensemble_config = training_config.get('ensemble', {})
         
+        # Hard negative mining configuration
+        self.hnm_config = training_config.get('hard_negative_mining', {})
+        self.hnm_enabled = self.hnm_config.get('enabled', False)
+        
         # Paths
         self.models_dir = Path(config.get('paths.output_dir')) / config.get('paths.models_dir')
         self.models_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +109,165 @@ class SVMTrainer:
             )
         
         return model
+    
+    def _train_initial_model(self, positive_features: np.ndarray, negative_features: np.ndarray,
+                           positive_labels: np.ndarray, negative_labels: np.ndarray) -> Tuple[Any, StandardScaler]:
+        """
+        Train initial SVM model on a balanced subset for hard negative mining.
+        
+        Args:
+            positive_features: All positive training features
+            negative_features: All negative training features
+            positive_labels: Labels for positive samples
+            negative_labels: Labels for negative samples
+            
+        Returns:
+            Tuple of (initial_model, scaler)
+        """
+        # Sample negatives for initial training
+        initial_ratio = self.hnm_config.get('initial_negative_ratio', 3.0)
+        num_negatives_needed = int(len(positive_features) * initial_ratio)
+        
+        if num_negatives_needed >= len(negative_features):
+            logger.warning(f"Not enough negatives for ratio {initial_ratio}. Using all available.")
+            sampled_negatives = negative_features
+            sampled_neg_labels = negative_labels
+        else:
+            # Random sampling
+            sample_method = self.hnm_config.get('initial_sample_method', 'random')
+            if sample_method == 'random':
+                np.random.seed(self.random_state)
+                indices = np.random.choice(len(negative_features), num_negatives_needed, replace=False)
+                sampled_negatives = negative_features[indices]
+                sampled_neg_labels = negative_labels[indices]
+            else:
+                # Stratified or other methods can be added here
+                indices = np.random.choice(len(negative_features), num_negatives_needed, replace=False)
+                sampled_negatives = negative_features[indices]
+                sampled_neg_labels = negative_labels[indices]
+        
+        # Combine positive and sampled negative features
+        initial_features = np.vstack([positive_features, sampled_negatives])
+        initial_labels = np.concatenate([positive_labels, sampled_neg_labels])
+        
+        # Scale features
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(initial_features)
+        
+        # Train initial model
+        logger.info(f"Training initial model on {len(positive_features)} positives and {len(sampled_negatives)} negatives")
+        initial_model = self.create_svm_model()
+        initial_model.fit(scaled_features, initial_labels)
+        
+        return initial_model, scaler
+    
+    def _collect_hard_negatives(self, initial_model: Any, scaler: StandardScaler,
+                               negative_features: np.ndarray, 
+                               positive_count: int) -> np.ndarray:
+        """
+        Collect hard negative samples (false positives) from initial model.
+        
+        Args:
+            initial_model: Trained initial SVM model
+            scaler: Feature scaler used for initial model
+            negative_features: All negative training features
+            positive_count: Number of positive samples (for ratio calculation)
+            
+        Returns:
+            Array of hard negative feature indices
+        """
+        # Scale negative features
+        scaled_negatives = scaler.transform(negative_features)
+        
+        # Get predictions and decision scores
+        predictions = initial_model.predict(scaled_negatives)
+        
+        # Find false positives (negatives predicted as positive)
+        false_positive_mask = predictions == 1
+        false_positive_indices = np.where(false_positive_mask)[0]
+        
+        logger.info(f"Found {len(false_positive_indices)} false positives out of {len(negative_features)} negatives")
+        
+        if len(false_positive_indices) == 0:
+            logger.warning("No false positives found. Using random hard negatives.")
+            # Fallback: use decision function to find negatives closest to decision boundary
+            if hasattr(initial_model, 'decision_function'):
+                decision_scores = initial_model.decision_function(scaled_negatives)
+                # Get negatives with highest decision scores (closest to positive class)
+                sorted_indices = np.argsort(-decision_scores)  # Sort descending
+            else:
+                # Random fallback
+                sorted_indices = np.random.permutation(len(negative_features))
+            false_positive_indices = sorted_indices[:int(positive_count * 2)]
+        
+        # Determine how many hard negatives to keep
+        hard_negative_ratio = self.hnm_config.get('hard_negative_ratio', 2.0)
+        max_hard_negatives = self.hnm_config.get('max_hard_negatives', 10000)
+        
+        num_hard_negatives = min(
+            int(positive_count * hard_negative_ratio),
+            max_hard_negatives,
+            len(false_positive_indices)
+        )
+        
+        # If we have decision scores, sort by confidence
+        if hasattr(initial_model, 'decision_function'):
+            fp_features = negative_features[false_positive_indices]
+            fp_scaled = scaler.transform(fp_features)
+            decision_scores = initial_model.decision_function(fp_scaled)
+            
+            # Sort by decision score (most confident mistakes first)
+            sorted_fp_indices = np.argsort(-decision_scores)
+            hard_negative_indices = false_positive_indices[sorted_fp_indices[:num_hard_negatives]]
+        else:
+            # Random selection from false positives
+            if len(false_positive_indices) > num_hard_negatives:
+                hard_negative_indices = np.random.choice(false_positive_indices, num_hard_negatives, replace=False)
+            else:
+                hard_negative_indices = false_positive_indices
+        
+        logger.info(f"Selected {len(hard_negative_indices)} hard negatives for final training")
+        return hard_negative_indices
+    
+    def _perform_hard_negative_mining(self, positive_features: np.ndarray, negative_features: np.ndarray,
+                                     positive_labels: np.ndarray, negative_labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Perform hard negative mining to reduce training set size and improve model focus.
+        
+        Args:
+            positive_features: All positive training features
+            negative_features: All negative training features
+            positive_labels: Labels for positive samples
+            negative_labels: Labels for negative samples
+            
+        Returns:
+            Tuple of (final_features, final_labels) with hard negatives
+        """
+        logger.info("Starting hard negative mining...")
+        
+        # Stage 1: Train initial model on balanced subset
+        initial_model, scaler = self._train_initial_model(
+            positive_features, negative_features,
+            positive_labels, negative_labels
+        )
+        
+        # Stage 2: Collect hard negatives
+        hard_negative_indices = self._collect_hard_negatives(
+            initial_model, scaler, negative_features, len(positive_features)
+        )
+        
+        # Stage 3: Create final training set
+        hard_negatives = negative_features[hard_negative_indices]
+        hard_neg_labels = negative_labels[hard_negative_indices]
+        
+        final_features = np.vstack([positive_features, hard_negatives])
+        final_labels = np.concatenate([positive_labels, hard_neg_labels])
+        
+        reduction_pct = (1 - len(hard_negatives) / len(negative_features)) * 100
+        logger.info(f"Hard negative mining complete. Training set reduced by {reduction_pct:.1f}%")
+        logger.info(f"Final training set: {len(positive_features)} positives, {len(hard_negatives)} hard negatives")
+        
+        return final_features, final_labels
     
     def optimize_hyperparameters(self, 
                                 features: np.ndarray, 
@@ -232,6 +395,8 @@ class SVMTrainer:
         """
         Train a single SVM model for specified feature type.
         
+        Supports optional hard negative mining for improved performance.
+        
         Args:
             features: Training feature matrix
             labels: Training labels  
@@ -242,23 +407,46 @@ class SVMTrainer:
         """
         logger.info(f"Training {feature_type} SVM model")
         
+        # Separate positive and negative samples for hard negative mining
+        positive_mask = labels == 1
+        negative_mask = labels == 0
+        
+        positive_features = features[positive_mask]
+        negative_features = features[negative_mask]
+        positive_labels = labels[positive_mask]
+        negative_labels = labels[negative_mask]
+        
+        logger.info(f"Initial dataset: {len(positive_features)} positives, {len(negative_features)} negatives")
+        
+        # Apply hard negative mining if enabled
+        if self.hnm_enabled:
+            final_features, final_labels = self._perform_hard_negative_mining(
+                positive_features, negative_features,
+                positive_labels, negative_labels
+            )
+        else:
+            # Use all samples
+            final_features = features
+            final_labels = labels
+            logger.info("Hard negative mining disabled. Using all samples.")
+        
         # Scale features
         scaler = StandardScaler()
-        scaled_features = scaler.fit_transform(features)
+        scaled_features = scaler.fit_transform(final_features)
         self.scalers[feature_type] = scaler
         
         # Optimize hyperparameters
-        optimization_results = self.optimize_hyperparameters(scaled_features, labels, feature_type)
+        optimization_results = self.optimize_hyperparameters(scaled_features, final_labels, feature_type)
         
         # Train final model with best parameters
         best_params = optimization_results['best_params']
         model = self.create_svm_model(**best_params)
-        model.fit(scaled_features, labels)
+        model.fit(scaled_features, final_labels)
         
         # Cross-validation evaluation
         cv_folds = self.cv_config.get('folds', 5)
         cv_scores = cross_val_score(
-            model, scaled_features, labels,
+            model, scaled_features, final_labels,
             cv=StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=self.random_state),
             scoring='f1'
         )
@@ -270,7 +458,7 @@ class SVMTrainer:
             # For probability-capable models (only SVC with probability=True has predict_proba)
             if hasattr(model, 'decision_function'):
                 decision_scores = model.decision_function(scaled_features)
-                auc_score = roc_auc_score(labels, decision_scores)
+                auc_score = roc_auc_score(final_labels, decision_scores)
             else:
                 auc_score = None
         except Exception:
@@ -287,9 +475,11 @@ class SVMTrainer:
             'cv_mean': np.mean(cv_scores),
             'cv_std': np.std(cv_scores),
             'auc_score': auc_score,
-            'training_samples': len(features),
+            'training_samples': len(final_features),
+            'original_samples': len(features),
             'feature_dimension': features.shape[1],
-            'class_distribution': np.bincount(labels),
+            'class_distribution': np.bincount(final_labels.astype(int)),
+            'hard_negative_mining_enabled': self.hnm_enabled,
             'timestamp': datetime.now().isoformat()
         }
         
