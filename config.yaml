@@ -165,8 +165,8 @@ evaluation:
   metrics:
     calculate_mape: true  # Mean Absolute Percentage Error
     calculate_mae: true   # Mean Absolute Error
-    simulated_images: 10  # Number of simulated images for image-level eval
-    simulated_windows_per_image: 20  # Windows per simulated image
+    # Note: Pipeline automatically works with real images and their JSON annotations
+    # Fallback simulation only used if window metadata is missing
     
   # Visualization settings
   visualization:
