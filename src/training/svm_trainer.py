@@ -3,6 +3,8 @@ SVM trainer module for all feature types (HOG, LBP, Combined, Stacking).
 
 This module implements comprehensive SVM training with hyperparameter tuning,
 cross-validation, and model persistence for the nurdle detection pipeline.
+
+Refactored for maintainability - delegates to specialized trainers.
 """
 
 import numpy as np
@@ -15,9 +17,7 @@ from typing import Dict, Any, List, Tuple, Optional, Union
 from sklearn.svm import LinearSVC, SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, GridSearchCV, StratifiedKFold
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-from sklearn.ensemble import StackingClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 
 try:
     import optuna
@@ -28,6 +28,11 @@ except ImportError:
 from ..utils.config import ConfigLoader
 from .bbox_regressor import BoundingBoxRegressor
 from ..feature_extraction.dimensionality_reduction import FeatureReducer
+from .hard_negative_miner import HardNegativeMiner
+from .ensemble_trainer import EnsembleTrainer
+from .incremental_trainer import IncrementalTrainer
+from .hyperparameter_optimizer import HyperparameterOptimizer
+from .model_persistence import ModelPersistence
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +62,6 @@ class SVMTrainer:
         self.svm_config = training_config.get('svm', {})
         self.cv_config = training_config.get('cross_validation', {})
         self.tuning_config = training_config.get('hyperparameter_tuning', {})
-        self.ensemble_config = training_config.get('ensemble', {})
-        
-        # Hard negative mining configuration
-        self.hnm_config = training_config.get('hard_negative_mining', {})
-        self.hnm_enabled = self.hnm_config.get('enabled', False)
         
         # Paths
         self.models_dir = Path(config.get('paths.output_dir')) / config.get('paths.models_dir')
@@ -70,17 +70,40 @@ class SVMTrainer:
         # Random state for reproducibility
         self.random_state = training_config.get('random_state', 42)
         
-        # Scalers for each feature type
-        self.scalers = {}
+        # Initialize model persistence handler
+        self.persistence = ModelPersistence(self.models_dir)
         
-        # Feature reducers for each feature type
-        self.feature_reducers = {}
+        # Delegate to persistence for scalers and reducers
+        self.scalers = self.persistence.scalers
+        self.feature_reducers = self.persistence.feature_reducers
+        self.trained_models = self.persistence.trained_models
+        
+        # Feature reduction configuration
         self.use_dimensionality_reduction = config.get_section('features').get(
             'dimensionality_reduction', {}
         ).get('enabled', False)
         
-        # Trained models
-        self.trained_models = {}
+        # Initialize specialized trainers
+        self.hard_negative_miner = HardNegativeMiner(
+            training_config.get('hard_negative_mining', {}),
+            self.random_state
+        )
+        
+        self.ensemble_trainer = EnsembleTrainer(
+            training_config.get('ensemble', {}),
+            self.random_state
+        )
+        
+        performance_config = config.get_section('system').get('performance', {})
+        self.incremental_trainer = IncrementalTrainer(
+            performance_config.get('incremental_training', {}),
+            self.random_state
+        )
+        
+        self.hyperparameter_optimizer = HyperparameterOptimizer(
+            self.tuning_config,
+            self.random_state
+        )
         
         logger.info("SVM trainer initialized")
     
@@ -118,171 +141,12 @@ class SVMTrainer:
         
         return model
     
-    def _train_initial_model(self, positive_features: np.ndarray, negative_features: np.ndarray,
-                           positive_labels: np.ndarray, negative_labels: np.ndarray) -> Tuple[Any, StandardScaler]:
-        """
-        Train initial SVM model on a balanced subset for hard negative mining.
-        
-        Args:
-            positive_features: All positive training features
-            negative_features: All negative training features
-            positive_labels: Labels for positive samples
-            negative_labels: Labels for negative samples
-            
-        Returns:
-            Tuple of (initial_model, scaler)
-        """
-        # Sample negatives for initial training
-        initial_ratio = self.hnm_config.get('initial_negative_ratio', 3.0)
-        num_negatives_needed = int(len(positive_features) * initial_ratio)
-        
-        if num_negatives_needed >= len(negative_features):
-            logger.warning(f"Not enough negatives for ratio {initial_ratio}. Using all available.")
-            sampled_negatives = negative_features
-            sampled_neg_labels = negative_labels
-        else:
-            # Random sampling
-            sample_method = self.hnm_config.get('initial_sample_method', 'random')
-            if sample_method == 'random':
-                np.random.seed(self.random_state)
-                indices = np.random.choice(len(negative_features), num_negatives_needed, replace=False)
-                sampled_negatives = negative_features[indices]
-                sampled_neg_labels = negative_labels[indices]
-            else:
-                # Stratified or other methods can be added here
-                indices = np.random.choice(len(negative_features), num_negatives_needed, replace=False)
-                sampled_negatives = negative_features[indices]
-                sampled_neg_labels = negative_labels[indices]
-        
-        # Combine positive and sampled negative features
-        initial_features = np.vstack([positive_features, sampled_negatives])
-        initial_labels = np.concatenate([positive_labels, sampled_neg_labels])
-        
-        # Scale features
-        scaler = StandardScaler()
-        scaled_features = scaler.fit_transform(initial_features)
-        
-        # Train initial model
-        logger.info(f"Training initial model on {len(positive_features)} positives and {len(sampled_negatives)} negatives")
-        initial_model = self.create_svm_model()
-        initial_model.fit(scaled_features, initial_labels)
-        
-        return initial_model, scaler
-    
-    def _collect_hard_negatives(self, initial_model: Any, scaler: StandardScaler,
-                               negative_features: np.ndarray, 
-                               positive_count: int) -> np.ndarray:
-        """
-        Collect hard negative samples (false positives) from initial model.
-        
-        Args:
-            initial_model: Trained initial SVM model
-            scaler: Feature scaler used for initial model
-            negative_features: All negative training features
-            positive_count: Number of positive samples (for ratio calculation)
-            
-        Returns:
-            Array of hard negative feature indices
-        """
-        # Scale negative features
-        scaled_negatives = scaler.transform(negative_features)
-        
-        # Get predictions and decision scores
-        predictions = initial_model.predict(scaled_negatives)
-        
-        # Find false positives (negatives predicted as positive)
-        false_positive_mask = predictions == 1
-        false_positive_indices = np.where(false_positive_mask)[0]
-        
-        logger.info(f"Found {len(false_positive_indices)} false positives out of {len(negative_features)} negatives")
-        
-        if len(false_positive_indices) == 0:
-            logger.warning("No false positives found. Using random hard negatives.")
-            # Fallback: use decision function to find negatives closest to decision boundary
-            if hasattr(initial_model, 'decision_function'):
-                decision_scores = initial_model.decision_function(scaled_negatives)
-                # Get negatives with highest decision scores (closest to positive class)
-                sorted_indices = np.argsort(-decision_scores)  # Sort descending
-            else:
-                # Random fallback
-                sorted_indices = np.random.permutation(len(negative_features))
-            false_positive_indices = sorted_indices[:int(positive_count * 2)]
-        
-        # Determine how many hard negatives to keep
-        hard_negative_ratio = self.hnm_config.get('hard_negative_ratio', 2.0)
-        max_hard_negatives = self.hnm_config.get('max_hard_negatives', 10000)
-        
-        num_hard_negatives = min(
-            int(positive_count * hard_negative_ratio),
-            max_hard_negatives,
-            len(false_positive_indices)
-        )
-        
-        # If we have decision scores, sort by confidence
-        if hasattr(initial_model, 'decision_function'):
-            fp_features = negative_features[false_positive_indices]
-            fp_scaled = scaler.transform(fp_features)
-            decision_scores = initial_model.decision_function(fp_scaled)
-            
-            # Sort by decision score (most confident mistakes first)
-            sorted_fp_indices = np.argsort(-decision_scores)
-            hard_negative_indices = false_positive_indices[sorted_fp_indices[:num_hard_negatives]]
-        else:
-            # Random selection from false positives
-            if len(false_positive_indices) > num_hard_negatives:
-                hard_negative_indices = np.random.choice(false_positive_indices, num_hard_negatives, replace=False)
-            else:
-                hard_negative_indices = false_positive_indices
-        
-        logger.info(f"Selected {len(hard_negative_indices)} hard negatives for final training")
-        return hard_negative_indices
-    
-    def _perform_hard_negative_mining(self, positive_features: np.ndarray, negative_features: np.ndarray,
-                                     positive_labels: np.ndarray, negative_labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Perform hard negative mining to reduce training set size and improve model focus.
-        
-        Args:
-            positive_features: All positive training features
-            negative_features: All negative training features
-            positive_labels: Labels for positive samples
-            negative_labels: Labels for negative samples
-            
-        Returns:
-            Tuple of (final_features, final_labels) with hard negatives
-        """
-        logger.info("Starting hard negative mining...")
-        
-        # Stage 1: Train initial model on balanced subset
-        initial_model, scaler = self._train_initial_model(
-            positive_features, negative_features,
-            positive_labels, negative_labels
-        )
-        
-        # Stage 2: Collect hard negatives
-        hard_negative_indices = self._collect_hard_negatives(
-            initial_model, scaler, negative_features, len(positive_features)
-        )
-        
-        # Stage 3: Create final training set
-        hard_negatives = negative_features[hard_negative_indices]
-        hard_neg_labels = negative_labels[hard_negative_indices]
-        
-        final_features = np.vstack([positive_features, hard_negatives])
-        final_labels = np.concatenate([positive_labels, hard_neg_labels])
-        
-        reduction_pct = (1 - len(hard_negatives) / len(negative_features)) * 100
-        logger.info(f"Hard negative mining complete. Training set reduced by {reduction_pct:.1f}%")
-        logger.info(f"Final training set: {len(positive_features)} positives, {len(hard_negatives)} hard negatives")
-        
-        return final_features, final_labels
-    
     def optimize_hyperparameters(self, 
                                 features: np.ndarray, 
                                 labels: np.ndarray,
                                 feature_type: str) -> Dict[str, Any]:
         """
-        Optimize SVM hyperparameters using Optuna or GridSearch.
+        Optimize SVM hyperparameters using delegated optimizer.
         
         Args:
             features: Training feature matrix
@@ -292,78 +156,10 @@ class SVMTrainer:
         Returns:
             Dictionary containing best parameters and optimization results
         """
-        if not self.tuning_config.get('enabled', False):
-            logger.info("Hyperparameter tuning disabled, using default parameters")
-            return {'best_params': self.svm_config, 'method': 'default'}
-        
-        if OPTUNA_AVAILABLE and self.tuning_config.get('use_optuna', True):
-            return self._optimize_with_optuna(features, labels, feature_type)
-        else:
-            return self._optimize_with_gridsearch(features, labels, feature_type)
-    
-    def _optimize_with_optuna(self, 
-                            features: np.ndarray, 
-                            labels: np.ndarray,
-                            feature_type: str) -> Dict[str, Any]:
-        """Optimize hyperparameters using Optuna."""
-        if not OPTUNA_AVAILABLE:
-            raise ImportError("Optuna not available")
-            
-        import optuna  # Import inside function to avoid issues
-            
-        logger.info(f"Starting Optuna optimization for {feature_type} features")
-        
-        def objective(trial):
-            # Suggest hyperparameters
-            C = trial.suggest_float('C', 0.01, 100.0, log=True)
-            
-            kernel = trial.suggest_categorical('kernel', ['linear', 'rbf'])
-            
-            params = {'C': C, 'kernel': kernel}
-            
-            if kernel != 'linear':
-                gamma = trial.suggest_categorical('gamma', ['scale', 'auto'])
-                params['gamma'] = gamma
-            
-            # Create and evaluate model
-            model = self.create_svm_model(**params)
-            
-            # Cross-validation
-            cv_folds = self.tuning_config.get('cv_folds', 3)
-            scores = cross_val_score(
-                model, features, labels,
-                cv=StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=self.random_state),
-                scoring='f1',
-                n_jobs=-1
-            )
-            
-            return float(np.mean(scores))
-        
-        # Create and run study
-        study = optuna.create_study(
-            direction='maximize',
-            sampler=optuna.samplers.TPESampler(seed=self.random_state)
+        return self.hyperparameter_optimizer.optimize(
+            features, labels, feature_type,
+            self.create_svm_model, self.svm_config
         )
-        
-        n_trials = self.tuning_config.get('n_trials', 50)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-        
-        results = {
-            'best_params': study.best_params,
-            'best_score': study.best_value,
-            'method': 'optuna',
-            'n_trials': len(study.trials)
-        }
-        
-        logger.info(f"Optuna optimization completed: {results['best_score']:.4f} F1 score")
-        return results
-    
-    def _optimize_with_gridsearch(self,
-                                features: np.ndarray,
-                                labels: np.ndarray, 
-                                feature_type: str) -> Dict[str, Any]:
-        """Optimize hyperparameters using GridSearchCV."""
-        logger.info(f"Starting GridSearch optimization for {feature_type} features")
         
         # Get parameter grid from config
         param_grid = self.tuning_config.get('param_grid', {
@@ -396,6 +192,49 @@ class SVMTrainer:
         logger.info(f"GridSearch optimization completed: {results['best_score']:.4f} F1 score")
         return results
     
+    def train_incremental_model(self,
+                               image_list: List[Path],
+                               feature_extractor,
+                               feature_type: str,
+                               dataset_builder=None) -> Dict[str, Any]:
+        """
+        Train model incrementally using generator for memory efficiency.
+        
+        This method processes images one by one, extracting windows and features
+        on-the-fly without storing everything in memory.
+        
+        Args:
+            image_list: List of image paths to process
+            feature_extractor: Feature extractor instance
+            feature_type: Type of features being trained
+            dataset_builder: TrainingDatasetBuilder instance
+            
+        Returns:
+            Dictionary containing trained model and training results
+        """
+        if not self.incremental_trainer.enabled:
+            logger.info("Incremental training not enabled, falling back to standard training")
+            return {}
+        
+        if dataset_builder is None:
+            logger.error("Dataset builder is required for incremental training")
+            return {}
+        
+        logger.info(f"Training {feature_type} model incrementally from {len(image_list)} images")
+        
+        # Get batch size from config
+        batch_size = self.incremental_trainer.partial_fit_batch_size
+        
+        # Create generator
+        feature_generator = dataset_builder.generate_training_batches(
+            image_list, feature_extractor, batch_size
+        )
+        
+        # Train using generator
+        return self.incremental_trainer.train_from_generator(
+            feature_generator, feature_type, total_samples=None
+        )
+    
     def train_single_model(self,
                           features: np.ndarray,
                           labels: np.ndarray,
@@ -415,6 +254,11 @@ class SVMTrainer:
         """
         logger.info(f"Training {feature_type} SVM model")
         
+        # Check if incremental training is enabled
+        if self.incremental_trainer.enabled:
+            logger.info("Using incremental training mode")
+            return self.incremental_trainer.train_incremental(features, labels, feature_type)
+        
         # Separate positive and negative samples for hard negative mining
         positive_mask = labels == 1
         negative_mask = labels == 0
@@ -426,17 +270,12 @@ class SVMTrainer:
         
         logger.info(f"Initial dataset: {len(positive_features)} positives, {len(negative_features)} negatives")
         
-        # Apply hard negative mining if enabled
-        if self.hnm_enabled:
-            final_features, final_labels = self._perform_hard_negative_mining(
-                positive_features, negative_features,
-                positive_labels, negative_labels
-            )
-        else:
-            # Use all samples
-            final_features = features
-            final_labels = labels
-            logger.info("Hard negative mining disabled. Using all samples.")
+        # Apply hard negative mining using delegated miner
+        final_features, final_labels = self.hard_negative_miner.mine_hard_negatives(
+            positive_features, negative_features,
+            positive_labels, negative_labels,
+            self.create_svm_model  # Pass model factory
+        )
         
         # Scale features
         scaler = StandardScaler()
@@ -504,7 +343,7 @@ class SVMTrainer:
             'reduced_dimension': scaled_features.shape[1] if feature_reducer else features.shape[1],
             'dimensionality_reduction_enabled': feature_reducer is not None,
             'class_distribution': np.bincount(final_labels.astype(int)),
-            'hard_negative_mining_enabled': self.hnm_enabled,
+            'hard_negative_mining_enabled': self.hard_negative_miner.enabled,
             'timestamp': datetime.now().isoformat()
         }
         
@@ -602,113 +441,20 @@ class SVMTrainer:
         Returns:
             Dictionary containing stacking model and results
         """
-        if not self.ensemble_config.get('stacking', {}).get('enabled', False):
-            logger.info("Stacking ensemble disabled")
-            return {}
-        
-        logger.info("Training stacking ensemble")
-        
-        # Get base model types
-        base_model_types = self.ensemble_config.get('stacking', {}).get('base_models', ['hog', 'lbp'])
-        
-        # Prepare base estimators
-        base_estimators = []
-        stacking_features_list = []
-        
-        # Get common samples (intersection of all feature types)
-        common_labels = None
-        min_samples = float('inf')
-        
-        for model_type in base_model_types:
-            if model_type in feature_data and model_type in self.trained_models:
-                n_samples = len(feature_data[model_type]['labels'])
-                if n_samples < min_samples:
-                    min_samples = n_samples
-                    common_labels = feature_data[model_type]['labels']
-        
-        if common_labels is None:
-            raise ValueError("No common samples found for stacking")
-        
-        # Create base estimators and prepare features
-        for model_type in base_model_types:
-            if model_type in self.trained_models:
-                model_package = self.trained_models[model_type]
-                base_estimators.append((
-                    f'{model_type}_svm',
-                    model_package['model']
-                ))
-                
-                # Get scaled features
-                features = feature_data[model_type]['features'][:min_samples]
-                scaled_features = self.scalers[model_type].transform(features)
-                stacking_features_list.append(scaled_features)
-        
-        if len(base_estimators) < 2:
-            raise ValueError("Need at least 2 base models for stacking")
-        
-        # Meta-classifier
-        meta_classifier_type = self.ensemble_config.get('stacking', {}).get('meta_classifier', 'logistic_regression')
-        
-        if meta_classifier_type == 'logistic_regression':
-            meta_classifier = LogisticRegression(random_state=self.random_state)
-        else:
-            # Use SVM as meta-classifier
-            meta_classifier = self.create_svm_model(C=1.0)
-        
-        # Create stacking classifier
-        stacking_cv = self.ensemble_config.get('stacking', {}).get('cv_folds', 3)
-        stacking_model = StackingClassifier(
-            estimators=base_estimators,
-            final_estimator=meta_classifier,
-            cv=stacking_cv,
-            n_jobs=-1
+        # Delegate to ensemble trainer
+        stacking_package = self.ensemble_trainer.train_stacking_ensemble(
+            feature_data,
+            self.trained_models,
+            self.scalers,
+            self.cv_config.get('folds', 5)
         )
         
-        # We need to create a feature matrix that combines all base features
-        # For stacking, we'll use the combined features if available
-        if 'combined' in feature_data:
-            stacking_features = feature_data['combined']['features'][:min_samples]
-            stacking_scaler = StandardScaler()
-            scaled_stacking_features = stacking_scaler.fit_transform(stacking_features)
-        else:
-            # Fallback: concatenate all available features
-            stacking_features = np.hstack(stacking_features_list)
-            stacking_scaler = StandardScaler()
-            scaled_stacking_features = stacking_scaler.fit_transform(stacking_features)
-        
-        # Train stacking model
-        stacking_model.fit(scaled_stacking_features, common_labels[:min_samples])
-        
-        # Cross-validation evaluation
-        cv_folds = self.cv_config.get('folds', 5)
-        cv_scores = cross_val_score(
-            stacking_model, scaled_stacking_features, common_labels[:min_samples],
-            cv=StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=self.random_state),
-            scoring='f1'
-        )
-        
-        # Create stacking package
-        stacking_package = {
-            'model': stacking_model,
-            'scaler': stacking_scaler,
-            'feature_type': 'stacking',
-            'base_models': base_model_types,
-            'meta_classifier': meta_classifier_type,
-            'cv_scores': cv_scores,
-            'cv_mean': np.mean(cv_scores),
-            'cv_std': np.std(cv_scores),
-            'training_samples': min_samples,
-            'feature_dimension': scaled_stacking_features.shape[1],
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # Save stacking model
-        self._save_model(stacking_package, 'stacking')
-        
-        # Store in trained models
-        self.trained_models['stacking'] = stacking_package
-        
-        logger.info(f"Stacking model trained - CV F1: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
+        if stacking_package:
+            # Save stacking model
+            self._save_model(stacking_package, 'stacking')
+            
+            # Store in trained models
+            self.trained_models['stacking'] = stacking_package
         
         return stacking_package
     
@@ -763,26 +509,7 @@ class SVMTrainer:
             model_package: Complete model package
             feature_type: Type of model being saved
         """
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Model filename
-        model_filename = f"svm_{feature_type}_model_{timestamp}.pkl"
-        model_path = self.models_dir / model_filename
-        
-        # Save model package
-        joblib.dump(model_package, model_path)
-        
-        # Save metadata separately
-        metadata = {k: v for k, v in model_package.items() 
-                   if k not in ['model', 'scaler', 'feature_reducer']}  # Exclude non-serializable objects
-        
-        metadata_filename = f"svm_{feature_type}_metadata_{timestamp}.json"
-        metadata_path = self.models_dir / metadata_filename
-        
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2, default=str)
-        
-        logger.info(f"Model saved: {model_filename}")
+        self.persistence.save_model(model_package, feature_type)
     
     def _save_bbox_regressor(self, regressor_package: Dict[str, Any], feature_type: str) -> None:
         """
@@ -792,26 +519,7 @@ class SVMTrainer:
             regressor_package: Complete regressor package
             feature_type: Type of features used for regression
         """
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Regressor filename
-        regressor_filename = f"bbox_regressor_{feature_type}_{timestamp}.pkl"
-        regressor_path = self.models_dir / regressor_filename
-        
-        # Save regressor package
-        joblib.dump(regressor_package, regressor_path)
-        
-        # Save metadata separately
-        metadata = {k: v for k, v in regressor_package.items() 
-                   if k not in ['regressor']}  # Exclude regressor object
-        
-        metadata_filename = f"bbox_regressor_{feature_type}_metadata_{timestamp}.json"
-        metadata_path = self.models_dir / metadata_filename
-        
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2, default=str)
-        
-        logger.info(f"Bbox regressor saved: {regressor_filename}")
+        self.persistence.save_bbox_regressor(regressor_package, feature_type)
     
     def load_model(self, model_path: str) -> Dict[str, Any]:
         """
@@ -823,18 +531,7 @@ class SVMTrainer:
         Returns:
             Loaded model package
         """
-        model_package = joblib.load(model_path)
-        feature_type = model_package['feature_type']
-        
-        # Store scaler and feature reducer for future use
-        self.scalers[feature_type] = model_package['scaler']
-        if 'feature_reducer' in model_package and model_package['feature_reducer'] is not None:
-            self.feature_reducers[feature_type] = model_package['feature_reducer']
-        
-        self.trained_models[feature_type] = model_package
-        
-        logger.info(f"Model loaded: {feature_type}")
-        return model_package
+        return self.persistence.load_model(Path(model_path))
     
     def get_model_summary(self) -> Dict[str, Any]:
         """
@@ -843,24 +540,4 @@ class SVMTrainer:
         Returns:
             Summary dictionary
         """
-        summary = {
-            'total_models': len(self.trained_models),
-            'models': {}
-        }
-        
-        for feature_type, model_package in self.trained_models.items():
-            if 'error' not in model_package:
-                summary['models'][feature_type] = {
-                    'cv_f1_mean': model_package.get('cv_mean', 0),
-                    'cv_f1_std': model_package.get('cv_std', 0),
-                    'training_samples': model_package.get('training_samples', 0),
-                    'feature_dimension': model_package.get('feature_dimension', 0),
-                    'timestamp': model_package.get('timestamp', 'unknown')
-                }
-            else:
-                summary['models'][feature_type] = {
-                    'status': 'failed',
-                    'error': model_package['error']
-                }
-        
-        return summary
+        return self.persistence.get_model_summary()

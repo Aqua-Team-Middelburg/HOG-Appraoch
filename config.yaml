@@ -306,10 +306,14 @@ system:
       
     # Incremental training (Phase 3.1)
     incremental_training:
-      enabled: false  # Use SGDClassifier instead of LinearSVC
-      partial_fit_batch_size: 5000  # Samples per partial_fit call
-      n_epochs: 5  # Number of passes over data
+      enabled: false  # Use SGDClassifier instead of LinearSVC for memory-efficient training
+      partial_fit_batch_size: 1000  # Windows per batch (reduced for memory efficiency)
+      n_epochs: 3  # Number of passes over data (reduced since we process more images)
       learning_rate: "optimal"  # "constant", "optimal", "invscaling", "adaptive"
+      
+      # Note: Enable this for large datasets that don't fit in memory
+      # When enabled, the pipeline processes images one by one using generators
+      # instead of loading all features into memory at once
       
     # Feature caching
     cache_features_to_disk: false  # Save features to disk for large datasets

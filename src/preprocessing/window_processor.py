@@ -17,6 +17,7 @@ import json
 
 from ..utils.config import ConfigLoader
 from .image_pyramid import ImagePyramid
+from .window_labeler import WindowLabeler
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +60,8 @@ class SlidingWindowProcessor:
         self.iou_threshold = training_config.get('iou_threshold', 0.5)
         self.gt_bbox_size = training_config.get('gt_bbox_size', 40)
         
-        # Center-point labeling configuration
-        self.labeling_method = training_config.get('labeling_method', 'center_point')
-        center_point_config = training_config.get('center_point', {})
-        self.allow_multiple_centers = center_point_config.get('allow_multiple_centers', False)
-        self.center_tolerance_px = center_point_config.get('center_tolerance_px', 0)
+        # Initialize window labeler with training configuration
+        self.labeler = WindowLabeler(training_config)
         
         # Paths
         self.normalized_dir = Path(config.get('paths.temp_dir')) / 'normalized_images'
@@ -117,64 +115,6 @@ class SlidingWindowProcessor:
             
         return intersection / union
     
-    def _calculate_nurdle_center(self, bbox: Dict[str, Any]) -> Tuple[int, int]:
-        """
-        Calculate the center point of a nurdle from its bounding box annotation.
-        
-        Args:
-            bbox: Ground truth bounding box dictionary
-            
-        Returns:
-            Tuple of (center_x, center_y) coordinates
-        """
-        # Try to get explicit center coordinates
-        if 'center_x' in bbox and 'center_y' in bbox:
-            return (int(bbox['center_x']), int(bbox['center_y']))
-        
-        # Calculate from bbox coordinates
-        if 'x' in bbox and 'y' in bbox:
-            x = bbox['x']
-            y = bbox['y']
-            width = bbox.get('width', self.gt_bbox_size)
-            height = bbox.get('height', self.gt_bbox_size)
-            
-            center_x = int(x + width / 2)
-            center_y = int(y + height / 2)
-            return (center_x, center_y)
-        
-        # Fallback: use radius if available
-        if 'radius' in bbox:
-            center_x = bbox.get('center_x', 0)
-            center_y = bbox.get('center_y', 0)
-            return (int(center_x), int(center_y))
-        
-        logger.warning(f"Could not calculate center for bbox: {bbox}")
-        return (0, 0)
-    
-    def _contains_center_point(self, window_bbox: Tuple[int, int, int, int], 
-                               center_point: Tuple[int, int]) -> bool:
-        """
-        Check if a window contains a ground truth center point.
-        
-        Args:
-            window_bbox: Window bounding box as (x, y, width, height)
-            center_point: Ground truth center as (center_x, center_y)
-            
-        Returns:
-            True if center point falls within window bounds (with tolerance)
-        """
-        win_x, win_y, win_w, win_h = window_bbox
-        center_x, center_y = center_point
-        
-        # Apply tolerance
-        tolerance = self.center_tolerance_px
-        
-        # Check if center is within window bounds (with tolerance)
-        x_in_bounds = (win_x - tolerance) <= center_x <= (win_x + win_w + tolerance)
-        y_in_bounds = (win_y - tolerance) <= center_y <= (win_y + win_h + tolerance)
-        
-        return x_in_bounds and y_in_bounds
-    
     def normalize_ground_truth_bbox(self, bbox: Dict[str, Any]) -> Tuple[int, int, int, int]:
         """
         Normalize ground truth bounding box to consistent size.
@@ -185,16 +125,8 @@ class SlidingWindowProcessor:
         Returns:
             Normalized bounding box as (x, y, width, height)
         """
-        # Extract center coordinates
-        center_x = bbox.get('center_x', bbox.get('x', 0) + bbox.get('width', 0) // 2)
-        center_y = bbox.get('center_y', bbox.get('y', 0) + bbox.get('height', 0) // 2)
-        
-        # Create normalized bbox centered at the same position
-        half_size = self.gt_bbox_size // 2
-        x = center_x - half_size
-        y = center_y - half_size
-        
-        return (x, y, self.gt_bbox_size, self.gt_bbox_size)
+        # Delegate to WindowLabeler
+        return self.labeler.normalize_ground_truth_bbox(bbox)
     
     def _get_stride(self, mode: str = 'default') -> int:
         """
@@ -279,7 +211,7 @@ class SlidingWindowProcessor:
         """
         Determine if a window is positive or negative based on ground truth.
         
-        Uses center-point labeling by default (configurable to use IoU for legacy support).
+        Delegates to WindowLabeler for labeling logic.
         
         Args:
             window_bbox: Window bounding box as (x, y, width, height)
@@ -288,82 +220,7 @@ class SlidingWindowProcessor:
         Returns:
             True if positive window, False otherwise
         """
-        if self.labeling_method == 'center_point':
-            return self._label_window_center_point(window_bbox, ground_truth_objects)
-        else:
-            # Legacy IoU-based labeling
-            return self._label_window_iou(window_bbox, ground_truth_objects)
-    
-    def _label_window_center_point(self, window_bbox: Tuple[int, int, int, int],
-                                   ground_truth_objects: List[Dict[str, Any]]) -> bool:
-        """
-        Label window as positive if it contains a ground truth center point.
-        
-        Args:
-            window_bbox: Window bounding box as (x, y, width, height)
-            ground_truth_objects: List of ground truth object annotations
-            
-        Returns:
-            True if window contains at least one ground truth center point
-        """
-        centers_found = 0
-        
-        for obj in ground_truth_objects:
-            # Get bounding box from object
-            if 'bbox' in obj:
-                bbox = obj['bbox']
-            else:
-                # Construct bbox from object attributes
-                bbox = obj
-            
-            # Calculate center point
-            center_point = self._calculate_nurdle_center(bbox)
-            
-            # Check if this window contains the center
-            if self._contains_center_point(window_bbox, center_point):
-                centers_found += 1
-                
-                # If we don't allow multiple centers and found one, return immediately
-                if not self.allow_multiple_centers:
-                    return True
-        
-        # If allowing multiple centers, return True if at least one found
-        if self.allow_multiple_centers and centers_found > 0:
-            if centers_found > 1:
-                logger.debug(f"Window contains {centers_found} nurdle centers")
-            return True
-        
-        return centers_found > 0
-    
-    def _label_window_iou(self, window_bbox: Tuple[int, int, int, int],
-                         ground_truth_objects: List[Dict[str, Any]]) -> bool:
-        """
-        Legacy IoU-based window labeling (kept for backward compatibility).
-        
-        Args:
-            window_bbox: Window bounding box as (x, y, width, height)
-            ground_truth_objects: List of ground truth object annotations
-            
-        Returns:
-            True if positive window (IoU >= threshold), False otherwise
-        """
-        for obj in ground_truth_objects:
-            # Normalize ground truth bbox
-            if 'bbox' in obj:
-                gt_bbox = self.normalize_ground_truth_bbox(obj['bbox'])
-            else:
-                # Create bbox from center coordinates and radius if available
-                center_x = obj.get('center_x', 0)
-                center_y = obj.get('center_y', 0)
-                radius = obj.get('radius', self.gt_bbox_size // 2)
-                gt_bbox = (center_x - radius, center_y - radius, radius * 2, radius * 2)
-            
-            # Calculate IoU
-            iou = self.calculate_iou(window_bbox, gt_bbox)
-            if iou >= self.iou_threshold:
-                return True
-        
-        return False
+        return self.labeler.label_window(window_bbox, ground_truth_objects)
     
     def process_image_for_training(self, image_path: Path) -> Dict[str, Any]:
         """
@@ -414,11 +271,11 @@ class SlidingWindowProcessor:
                 positive_windows.append(window_data)
                 
                 # Track which centers this window captured
-                if self.labeling_method == 'center_point':
+                if self.labeler.labeling_method == 'center_point':
                     for idx, obj in enumerate(ground_truth_objects):
                         bbox_data = obj.get('bbox', obj)
-                        center = self._calculate_nurdle_center(bbox_data)
-                        if self._contains_center_point(bbox, center):
+                        center = self.labeler.calculate_nurdle_center(bbox_data)
+                        if self.labeler.contains_center_point(bbox, center):
                             centers_captured.add(idx)
             else:
                 negative_windows.append(window_data)
@@ -439,10 +296,10 @@ class SlidingWindowProcessor:
             'ground_truth_objects': total_ground_truth,
             'centers_captured': captured_count,
             'capture_rate': capture_rate,
-            'labeling_method': self.labeling_method
+            'labeling_method': self.labeler.labeling_method
         }
         
-        if self.labeling_method == 'center_point':
+        if self.labeler.labeling_method == 'center_point':
             logger.debug(f"Processed {image_path.name}: {len(positive_windows)} positive windows, "
                         f"{captured_count}/{total_ground_truth} centers captured ({capture_rate:.1f}%)")
         else:
@@ -579,147 +436,44 @@ class SlidingWindowProcessor:
         """
         Generate a balanced training dataset from all normalized images.
         
+        Delegates to TrainingDatasetBuilder for batch processing.
+        
         Args:
             positive_ratio: Desired ratio of positive to total samples
             
         Returns:
             Dictionary containing balanced training data and statistics
         """
-        logger.info("Generating balanced training dataset...")
+        from .training_dataset_builder import TrainingDatasetBuilder
         
-        # Get all normalized image files
-        image_files = []
-        for ext in ['.jpg', '.jpeg', '.png']:
-            image_files.extend(list(self.normalized_dir.glob(f"*{ext}")))
-        
-        if not image_files:
-            raise ValueError("No normalized images found. Run normalization first.")
-        
-        logger.info(f"Processing {len(image_files)} images for training data")
-        
-        all_positive_windows = []
-        all_negative_windows = []
-        
-        # Process each image
-        for image_path in tqdm(image_files, desc="Processing images"):
-            result = self.process_image_for_training(image_path)
-            
-            if result['success']:
-                all_positive_windows.extend(result['positive_data'])
-                all_negative_windows.extend(result['negative_data'])
-        
-        # Balance the dataset
-        num_positive = len(all_positive_windows)
-        num_negative_needed = int(num_positive * (1 - positive_ratio) / positive_ratio)
-        
-        if num_negative_needed > len(all_negative_windows):
-            logger.warning(f"Not enough negative samples. Using all {len(all_negative_windows)} available.")
-            balanced_negative_windows = all_negative_windows
-        else:
-            # Randomly sample negative windows
-            np.random.seed(self.config.get('system.reproducibility.random_seed', 42))
-            indices = np.random.choice(len(all_negative_windows), num_negative_needed, replace=False)
-            balanced_negative_windows = [all_negative_windows[i] for i in indices]
-        
-        # Save processed windows
-        self._save_processed_windows(all_positive_windows, balanced_negative_windows)
-        
-        results = {
-            'total_images_processed': len(image_files),
-            'total_positive_windows': num_positive,
-            'total_negative_windows_available': len(all_negative_windows),
-            'balanced_negative_windows': len(balanced_negative_windows),
-            'final_positive_ratio': num_positive / (num_positive + len(balanced_negative_windows)),
-            'output_directory': str(self.candidate_dir)
-        }
-        
-        logger.info(f"Training dataset generated: {results}")
-        return results
+        builder = TrainingDatasetBuilder(self.config, self)
+        return builder.generate_balanced_dataset(positive_ratio)
     
     def _save_processed_windows(self, positive_windows: List[Dict], negative_windows: List[Dict]) -> None:
         """
         Save processed windows to disk for training.
         
+        Delegates to TrainingDatasetBuilder.
+        
         Args:
             positive_windows: List of positive window data
             negative_windows: List of negative window data
         """
-        logger.info("Saving processed windows...")
+        from .training_dataset_builder import TrainingDatasetBuilder
         
-        # Extract window arrays
-        positive_arrays = [w['window'] for w in positive_windows]
-        negative_arrays = [w['window'] for w in negative_windows]
-        
-        # Save as numpy arrays
-        if positive_arrays:
-            np.save(self.candidate_dir / 'processed_windows_positive.npy', positive_arrays)
-        if negative_arrays:
-            np.save(self.candidate_dir / 'processed_windows_negative.npy', negative_arrays)
-        
-        # Save metadata
-        metadata = {
-            'window_size': self.window_size,
-            'stride': self.stride,
-            'labeling_method': self.labeling_method,
-            'iou_threshold': self.iou_threshold if self.labeling_method == 'iou' else None,
-            'center_tolerance_px': self.center_tolerance_px if self.labeling_method == 'center_point' else None,
-            'allow_multiple_centers': self.allow_multiple_centers if self.labeling_method == 'center_point' else None,
-            'gt_bbox_size': self.gt_bbox_size,
-            'positive_count': len(positive_windows),
-            'negative_count': len(negative_windows)
-        }
-        
-        with open(self.candidate_dir / 'window_metadata.json', 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        # Save detailed statistics
-        stats = {
-            'processing_stats': self.stats,
-            'positive_samples': [
-                {
-                    'image_name': w['image_name'],
-                    'bbox': w['bbox']
-                }
-                for w in positive_windows
-            ],
-            'negative_samples': [
-                {
-                    'image_name': w['image_name'],
-                    'bbox': w['bbox']
-                }
-                for w in negative_windows
-            ]
-        }
-        
-        with open(self.candidate_dir / 'processing_stats.json', 'w') as f:
-            json.dump(stats, f, indent=2)
-        
-        logger.info(f"Saved {len(positive_windows)} positive and {len(negative_windows)} negative windows "
-                   f"(labeling method: {self.labeling_method})")
-
+        builder = TrainingDatasetBuilder(self.config, self)
+        builder.save_processed_windows(positive_windows, negative_windows)
     
     def load_processed_windows(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Load previously processed training windows.
         
+        Delegates to TrainingDatasetBuilder.
+        
         Returns:
             Tuple of (positive_windows, negative_windows, all_windows, labels)
         """
-        positive_path = self.candidate_dir / 'processed_windows_positive.npy'
-        negative_path = self.candidate_dir / 'processed_windows_negative.npy'
+        from .training_dataset_builder import TrainingDatasetBuilder
         
-        if not positive_path.exists() or not negative_path.exists():
-            raise FileNotFoundError("Processed windows not found. Run generate_balanced_training_dataset first.")
-        
-        positive_windows = np.load(positive_path)
-        negative_windows = np.load(negative_path)
-        
-        # Combine and create labels
-        all_windows = np.concatenate([positive_windows, negative_windows], axis=0)
-        labels = np.concatenate([
-            np.ones(len(positive_windows)),
-            np.zeros(len(negative_windows))
-        ])
-        
-        logger.info(f"Loaded {len(positive_windows)} positive and {len(negative_windows)} negative windows")
-        return positive_windows, negative_windows, all_windows, labels
+        builder = TrainingDatasetBuilder(self.config, self)
+        return builder.load_processed_windows()

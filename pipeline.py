@@ -247,6 +247,90 @@ class NurdleDetectionPipeline:
             logger.error(traceback.format_exc())
             raise
     
+    def _run_incremental_training(self, trainer) -> Dict[str, Any]:
+        """
+        Run incremental training using generators for memory efficiency.
+        
+        Args:
+            trainer: Initialized SVM trainer
+            
+        Returns:
+            Training results dictionary
+        """
+        logger.info("Setting up incremental training pipeline...")
+        
+        # Get training images
+        train_dir = Path(self.config.get('paths.input_dir')) / 'train'
+        if not train_dir.exists():
+            # Fallback to main input directory
+            train_dir = Path(self.config.get('paths.input_dir'))
+        
+        # Get list of training images
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+        image_list = []
+        for ext in image_extensions:
+            image_list.extend(list(train_dir.glob(f'*{ext}')))
+            image_list.extend(list(train_dir.glob(f'*{ext.upper()}')))
+        
+        if not image_list:
+            raise ValueError(f"No training images found in {train_dir}")
+        
+        logger.info(f"Found {len(image_list)} training images")
+        
+        # Initialize components
+        from src.preprocessing.window_processor import SlidingWindowProcessor
+        from src.preprocessing.training_dataset_builder import TrainingDatasetBuilder
+        from src.feature_extraction.combined_extractor import CombinedFeatureExtractor
+        
+        window_processor = SlidingWindowProcessor(self.config)
+        dataset_builder = TrainingDatasetBuilder(self.config, window_processor)
+        feature_extractor = CombinedFeatureExtractor(self.config)
+        
+        # Pass dataset builder to trainer method
+        
+        # Train models incrementally for each feature type
+        training_results = {}
+        
+        for feature_type in ['hog', 'lbp', 'combined']:
+            logger.info(f"Training {feature_type} model incrementally...")
+            try:
+                # Get appropriate extractor
+                if feature_type == 'hog':
+                    extractor = feature_extractor.hog_extractor
+                elif feature_type == 'lbp':
+                    extractor = feature_extractor.lbp_extractor
+                else:  # combined
+                    extractor = feature_extractor
+                
+                # Get batch size from config
+                performance_config = self.config.get_section('system').get('performance', {})
+                batch_size = performance_config.get('incremental_training', {}).get('partial_fit_batch_size', 1000)
+                
+                # Train using incremental method
+                result = trainer.train_incremental_model(
+                    image_list, extractor, feature_type, dataset_builder
+                )
+                
+                if result:
+                    training_results[feature_type] = result
+                    logger.info(f"✅ {feature_type} incremental training completed")
+                else:
+                    logger.warning(f"❌ {feature_type} incremental training failed")
+                    
+            except Exception as e:
+                logger.error(f"❌ {feature_type} incremental training failed: {e}")
+                training_results[feature_type] = {'error': str(e)}
+        
+        # Note: Stacking ensemble not supported with incremental training
+        # Would require storing base model predictions
+        
+        return {
+            'training_results': training_results,
+            'training_method': 'incremental',
+            'trained_model_types': list(training_results.keys()),
+            'models_directory': str(trainer.models_dir)
+        }
+    
     def run_step_training(self) -> Dict[str, Any]:
         """
         Step 5: Train SVM models on extracted features with comprehensive optimization.
@@ -261,9 +345,20 @@ class NurdleDetectionPipeline:
         try:
             import numpy as np
             from src.training import SVMTrainer
+            from src.preprocessing.training_dataset_builder import TrainingDatasetBuilder
             
             # Initialize SVM trainer
             trainer = SVMTrainer(self.config)
+            
+            # Check if incremental training is enabled
+            performance_config = self.config.get_section('system').get('performance', {})
+            incremental_enabled = performance_config.get('incremental_training', {}).get('enabled', False)
+            
+            if incremental_enabled:
+                logger.info("🔄 Incremental training enabled - using memory-efficient approach")
+                return self._run_incremental_training(trainer)
+            else:
+                logger.info("📊 Standard training - loading all features into memory")
             
             # Load extracted features
             features_dir = Path(self.config.get('paths.extracted_features_dir', 'temp/extracted_features'))
