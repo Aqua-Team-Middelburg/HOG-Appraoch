@@ -1,244 +1,46 @@
-# HOG/LBP/SVM Pipeline Configuration
-# ===================================
-# This file contains all configurable parameters for the nurdle detection pipeline.
-# Modify these values to customize the behavior without changing code.
+# Nurdle Detection Pipeline - Two-Stage Detection Configuration
+# ==============================================================
+# SVM Classifier → SVR Regressor → Optional Stacking
+# Optimized for simplicity and correctness
 
 # Project Information
 project:
   name: "Nurdle Detection Pipeline"
-  version: "1.0.0"
-  description: "HOG/LBP feature extraction with SVM classification for nurdle detection"
-  
-# File Paths and Directories
-paths:
-  # Input directory containing raw images and JSON annotation files
-  input_dir: "input"
-  
-  # Output directory for all generated files
-  output_dir: "output"
-  
-  # Subdirectories under output_dir
-  models_dir: "models"
-  evaluations_dir: "evaluations" 
-  visualizations_dir: "visualizations"
-  figures_dir: "visualizations"  # Added for evaluation plots
-  logs_dir: "logs"
-  
-  # Temporary directories for intermediate processing
-  temp_dir: "temp"
-  normalized_images_dir: "temp/normalized"
-  candidate_windows_dir: "temp/candidate_windows"
-  extracted_features_dir: "temp/extracted_features"
-  
-  # Test set directory (optional - if exists, will be used instead of train/test split)
-  test_set_dir: "test_set"
+  version: "2.0.0"
+  description: "Two-stage nurdle detection with SVM classifier and SVR coordinate regression"
 
 # Data Processing Configuration
 data:
-  # Train/test split configuration
-  test_size: 0.3  # Fraction of data to use for testing (0.0-1.0)
-  random_state: 42  # Random seed for reproducible splits
-  stratify: true  # Whether to maintain class balance in train/test split
-  
-  # Data validation settings
-  min_images_required: 10  # Minimum number of images needed to run pipeline
-  validate_json_format: true  # Whether to validate JSON annotation format
-  
-  # Image format requirements
-  supported_formats: [".jpg", ".jpeg", ".png", ".bmp", ".tiff"]
-  max_image_size_mb: 50  # Maximum allowed image file size in MB
+  train_test_ratio: 0.8           # Fraction for training (0.8 = 80% train, 20% test)
+  target_resolution: 1080         # Target image resolution for normalization
+  batch_size: 15                  # Images per RAM batch (memory management)
+  input_dir: "input"              # Input directory with images and JSON files
+  output_dir: "output"            # Output directory for results
 
-# Image Preprocessing Configuration
-preprocessing:
-  # Target window size for all processing (width, height) - OPTIMIZED FOR 5-15px OBJECTS
-  target_size: [20, 20]  # Reduced from 40x40 to 20x20 for small nurdles
-  
-  # Image normalization settings
-  normalization:
-    target_max_dimension: 1080  # Maximum dimension for normalized images
-    preserve_aspect_ratio: true  # Maintain aspect ratios during resize
-  
-  # Contrast enhancement method - ENHANCED FOR SMALL OBJECTS
-  # Options: "contrast_stretch", "histogram_eq", "adaptive_eq", "none"
-  contrast_method: "adaptive_eq"  # Better for small object contrast
-  
-  # Parameters for contrast stretching (percentile clipping)
-  contrast_percentiles: [1, 99]  # More aggressive clipping for small objects
-  
-  # Parameters for adaptive histogram equalization (CLAHE) - OPTIMIZED FOR SMALL OBJECTS
-  clahe:
-    clip_limit: 3.0  # Higher contrast for small object visibility
-    tile_grid_size: [4, 4]  # Finer grid for local enhancement
-  
-  # Sliding window configuration for candidate generation - OPTIMIZED FOR SMALL OBJECTS
-  sliding_window:
-    window_size: [20, 20]  # Reduced window size for 5-15px objects
-    stride: 8  # Much smaller stride to avoid missing small objects
-    
-    # Separate stride for training vs inference (Phase 3.2 optimization)
-    stride_train: 10  # Dense sampling even for training (small objects need it)
-    stride_inference: 5   # Very dense inference to catch all small objects
-    use_separate_strides: true  # ENABLE for small object optimization
-    
-    # Boundary handling
-    pad_image: true  # Whether to pad image to ensure full coverage
-    min_window_coverage: 0.8  # Minimum fraction of window that must be inside image
+# Window Processing Configuration
+windows:
+  size: [20, 20]                  # Window size [width, height]
+  stride: 12                      # Sliding window stride
 
-# Feature Extraction Configuration
+# Feature Extraction Configuration  
 features:
-  # Histogram of Oriented Gradients (HOG) parameters - OPTIMIZED FOR SMALL OBJECTS (5-15px)
-  hog:
-    orientations: 9  # Number of orientation bins
-    pixels_per_cell: [4, 4]  # REDUCED from 8x8 to 4x4 for small objects (critical change!)
-    cells_per_block: [2, 2]  # Keep 2x2 blocks but they're now smaller
-    block_norm: "L2-Hys"  # Block normalization method
-    transform_sqrt: true  # Enable power law compression for better small object contrast
-    
-    # Color feature extraction (Phase 1.2) - NOW ENABLED
-    use_color: true  # Extract from RGB channels vs grayscale - ENABLED FOR BETTER PERFORMANCE
-    color_space: "RGB"  # "RGB", "HSV", "LAB" (for future experimentation)
-    
-  # Local Binary Pattern (LBP) parameters - OPTIMIZED FOR SMALL OBJECTS
-  lbp:
-    n_points: 8  # Number of sample points on circle
-    radius: 1  # Keep radius 1 - good for fine texture in small objects
-    method: "uniform"  # LBP method: "uniform", "nri_uniform", "default"
-    
-  # Feature combination settings
-  combination:
-    # Which features to extract: "hog", "lbp", "combined"
-    feature_types: ["hog", "lbp", "combined"]
-    
-    # Whether to normalize features before combining
-    normalize_before_combine: false
-  
-  # Feature dimensions (for reference - auto-calculated) - UPDATED FOR 20x20 WINDOWS WITH 4x4 CELLS
-  # With 20x20 windows and 4x4 cells: 5x5 cells = 25 cells per channel
-  # With 2x2 blocks: 4x4 = 16 blocks per channel  
-  # HOG dimensions per channel: 16 blocks × 9 orientations = 144
-  # Grayscale HOG: 144 dimensions
-  # RGB HOG: 432 dimensions (144 × 3 channels) 
-  # LBP: 10 dimensions (grayscale)
-  # Combined grayscale: 154 dimensions
-  # Combined RGB: 442 dimensions
-  
-  # Dimensionality Reduction (Phase 3.3) - NOW ENABLED
-  dimensionality_reduction:
-    enabled: true  # Enable PCA to reduce feature dimensions - ENABLED FOR MEMORY EFFICIENCY
-    method: "pca"  # Only "pca" supported currently
-    
-    # PCA configuration
-    pca:
-      n_components: "auto"  # "auto", integer, or float (variance ratio)
-      variance_threshold: 0.95  # If "auto", retain 95% of variance
-      whiten: false  # Whether to whiten (normalize) PCA components
-      
-    # Manual target dimensions (optional - overrides n_components) - UPDATED FOR NEW FEATURE SIZES
-    target_dimensions:
-      hog: 80   # Reduce HOG from 144/432 to 80 dimensions 
-      lbp: null  # null = keep original (LBP already small at 10D)
-      combined: 120  # Target for combined features (from ~442D to 120D)
+  hog_cell_size: [4, 4]           # HOG cell size
 
-# Model Training Configuration
+# Training Configuration
 training:
-  # Window labeling method (Phase 1.1)
-  labeling_method: "center_point"  # "center_point" or "iou" (legacy)
-  
-  # Center-point labeling configuration (Phase 1.1)
-  center_point:
-    allow_multiple_centers: false  # If >1 center in window, still label positive?
-    center_tolerance_px: 0  # Pixels of tolerance around exact center
-  
-  # Legacy IoU threshold for positive window labeling (used if labeling_method="iou")
-  iou_threshold: 0.5
-  
-  # Ground truth bounding box normalization size - UPDATED FOR SMALL OBJECTS
-  gt_bbox_size: 20  # Reduced from 40 to match new window size
-  
-  # Hard Negative Mining (Phase 1.3)
-  hard_negative_mining:
-    enabled: true  # Enable two-stage training with hard negative mining
-    
-    # Stage 1: Initial training
-    initial_negative_ratio: 3.0  # Negatives per positive in initial training
-    initial_sample_method: "random"  # "random" or "stratified"
-    
-    # Stage 2: Hard negative collection
-    false_positive_threshold: 0.0  # SVM decision threshold for FP collection
-    max_hard_negatives: 10000  # Maximum hard negatives to collect
-    hard_negative_ratio: 2.0  # Hard negatives per positive in final training
-    
-    # Iterations (for future enhancement)
-    mining_iterations: 1  # Number of hard negative mining iterations
-  
-  # Bounding Box Regression (Phase 2.1) - NOW ENABLED
-  bounding_box_regression:
-    enabled: true  # Enable bbox refinement after classification - ENABLED FOR PRECISE LOCALIZATION
-    
-    # Regression model type
-    regressor_type: "svr"  # "svr" (Support Vector Regression) or "ridge" (Ridge Regression)
-    
-    # SVR parameters (used if regressor_type="svr")
-    kernel: "linear"  # "linear", "rbf", "poly"
-    C: 1.0  # Regularization parameter
-    epsilon: 0.1  # Epsilon-tube for SVR
-    
-    # Ridge parameters (used if regressor_type="ridge")
-    alpha: 1.0  # L2 regularization strength
-    
-    # Target normalization
-    normalize_targets: true  # Normalize regression targets (recommended)
-    clip_targets: true  # Clip targets to valid ranges
-    max_offset_ratio: 0.5  # Maximum offset as fraction of window size
-    
-    # Multi-output handling
-    independent_outputs: true  # Train separate regressor for each output dimension
-  
-  # Support Vector Machine (SVM) parameters
-  svm:
-    # SVM type and kernel
-    kernel: "linear"  # "linear", "poly", "rbf", "sigmoid"
-    C: 1.0  # Regularization parameter
-    gamma: "scale"  # Kernel coefficient for rbf/poly/sigmoid
-    
-    # Training parameters
-    max_iter: 1000  # Maximum number of iterations
-    random_state: 42  # Random seed for reproducible results
-    
-    # Class balancing
-    class_weight: null  # "balanced" for automatic balancing, null for no balancing
-    
-  # Cross-validation settings
-  cross_validation:
-    enabled: true
-    folds: 5  # Number of CV folds
-    scoring: "f1"  # Scoring metric: "accuracy", "precision", "recall", "f1"
-    
-  # Feature scaling
-  scaling:
-    method: "standard"  # "standard", "minmax", "robust", "none"
-    
-  # Model selection and hyperparameter tuning
-  hyperparameter_tuning:
-    enabled: true  # Whether to perform hyperparameter optimization
-    use_optuna: true  # Use Optuna for optimization (if available)
-    n_trials: 50  # Number of Optuna trials
-    cv_folds: 3  # Folds for hyperparameter CV
-    
-    # Fallback GridSearch parameters (used if Optuna not available)
-    param_grid:
-      C: [0.1, 1.0, 10.0, 100.0]
-      kernel: ["linear", "rbf"]
-      gamma: ["scale", "auto"]
-    
-  # Ensemble methods
-  ensemble:
-    # Stacking classifier configuration
-    stacking:
-      enabled: true  # Whether to train stacking ensemble
-      base_models: ["hog", "lbp"]  # Feature types for base models
-      meta_classifier: "logistic_regression"  # "logistic_regression" or "svm"
-      cv_folds: 3  # Folds for stacking CV
+  negative_positive_ratio: 3.0    # Ratio of negative to positive samples (3:1)
+  min_distance_from_nurdles: 25   # Minimum pixel distance for negative sample selection
+
+# Model Confidence Configuration
+confidence:
+  svm_threshold: 0.5              # Minimum SVM confidence to consider window positive
+  svr_method: "ensemble"          # "ensemble", "cv_residuals", or "simple"
+  svr_ensemble_size: 5            # If using ensemble method
+
+# Stacked Model Configuration (optional advanced mode)
+stacking:
+  enabled: false                  # Set to true to train and evaluate stacked model
+  meta_learner: "logistic_regression"  # or "random_forest"
 
 # Evaluation Configuration  
 evaluation:
@@ -266,34 +68,6 @@ evaluation:
     iou_threshold: 0.5  # IoU threshold for Non-Maximum Suppression
     optimize_threshold: true  # Whether to optimize detection threshold
     threshold_optimization_metric: "f1"  # Metric for threshold optimization
-    
-    # Phase 2 enhancements - NOW ENABLED
-    apply_bbox_refinement: true  # Use bbox regression during inference - ENABLED
-    min_confidence_for_refinement: 0.5  # Only refine high-confidence detections
-    multi_scale_nms: true  # Use scale-aware NMS - ENABLED
-    scale_nms_threshold: 0.3  # IoU threshold for cross-scale suppression
-
-# Multi-Scale Detection Configuration (Phase 2.2) - OPTIMIZED FOR SMALL OBJECTS
-multi_scale_detection:
-  # Image pyramid parameters
-  pyramid:
-    enabled: true  # Enable multi-scale detection via image pyramids - CRITICAL FOR 5-15px OBJECTS
-    
-    # Pyramid generation - TUNED FOR SMALL OBJECT SCALE RANGE
-    scale_factor: 1.25  # Smaller factor for finer scale sampling (was 1.5)
-    min_size: [100, 100]  # Minimum image size - need sufficient resolution for 5px objects
-    max_levels: 6  # More levels to cover small object scale range
-    
-    # Interpolation method for resizing
-    # Options: "nearest", "linear", "cubic", "area", "lanczos"
-    interpolation: "linear"
-  
-  # Scale-aware NMS parameters
-  nms:
-    enabled: true  # Use scale-aware NMS instead of standard NMS - ENABLED FOR MULTI-SCALE
-    iou_threshold: 0.5  # IoU threshold for cross-scale suppression
-    scale_penalty: 0.1  # Score penalty for coarser scales (0.0-1.0)
-    # Higher penalty favors detections from finer (original-size) scales
 
 # System Configuration
 system:
@@ -308,34 +82,7 @@ system:
   performance:
     # Parallel processing
     n_jobs: -1  # Number of parallel jobs (-1 for all cores, 1 for no parallelism)
-    
-    # Memory management (Phase 3.1) - NOW ENABLED
-    batch_processing:
-      enabled: true  # Use generators for memory efficiency (large datasets) - ENABLED FOR SCALABILITY
-      batch_size: 1000  # Windows per batch
-      
-    # Incremental training (Phase 3.1) - NOW ENABLED FOR LARGE DATASETS
-    incremental_training:
-      enabled: true  # Use SGDClassifier instead of LinearSVC for memory-efficient training - ENABLED
-      partial_fit_batch_size: 1000  # Windows per batch (reduced for memory efficiency)
-      n_epochs: 3  # Number of passes over data (reduced since we process more images)
-      learning_rate: "optimal"  # "constant", "optimal", "invscaling", "adaptive"
-      
-      # Note: Enable this for large datasets that don't fit in memory
-      # When enabled, the pipeline processes images one by one using generators
-      # instead of loading all features into memory at once
-      
-    # Feature caching
-    cache_features_to_disk: false  # Save features to disk for large datasets
-    feature_cache_dir: "temp/feature_cache"
-    
-    # Memory limits
     batch_size: 1000  # Batch size for processing large datasets
-    memory_limit_gb: 8  # Memory limit in GB (for monitoring)
-    
-    # Progress reporting
-    show_progress: true  # Whether to show progress bars
-    progress_update_interval: 100  # Update progress every N items
     
   # Reproducibility
   reproducibility:
@@ -364,6 +111,26 @@ model_management:
   save_metadata: true  # Save model training metadata
   metadata_format: "json"  # Format for metadata files
 
+# Hyperparameter Optimization Configuration
+optimization:
+  # Sequential optimization strategy
+  svm_optimization:
+    metric: "f1_score"
+    n_trials: 20
+    parameter_ranges:
+      svm_c: [0.001, 100.0]  # log scale
+      svm_kernel: ["linear", "rbf"]
+      svm_gamma: [0.001, 1.0]  # log scale, only for rbf
+  
+  svr_optimization:
+    metric: "avg_coordinate_error"  # minimize this
+    n_trials: 20
+    parameter_ranges:
+      svr_c: [0.001, 100.0]  # log scale
+      svr_kernel: ["linear", "rbf"]
+      svr_gamma: [0.001, 1.0]  # log scale, only for rbf
+      svr_epsilon: [0.01, 1.0]  # regression tolerance
+    
 # Pipeline Control
 pipeline:
   # Which steps to run (useful for partial execution)

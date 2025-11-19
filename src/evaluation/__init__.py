@@ -1,14 +1,18 @@
 """
-Evaluation module for nurdle detection pipeline.
+Evaluation Module for Nurdle Detection Pipeline
+==============================================
 
-This module provides comprehensive evaluation capabilities including:
-- Window-level and image-level performance metrics
-- Model comparison and ranking
-- ROC and Precision-Recall curve analysis
-- Confusion matrix visualization
-- Statistical analysis and reporting
+This module provides evaluation functionality for the nurdle detection pipeline,
+including metrics calculation, coordinate matching, and results reporting.
 """
 
 from .evaluator import ModelEvaluator
+from .metrics import EvaluationMetrics, CoordinateMatching
+from .nms import NonMaximumSuppression
 
-__all__ = ['ModelEvaluator']
+__all__ = [
+    'ModelEvaluator',
+    'EvaluationMetrics', 
+    'CoordinateMatching',
+    'NonMaximumSuppression'
+]

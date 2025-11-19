@@ -1,686 +1,383 @@
 """
-Comprehensive evaluation module for nurdle detection pipeline.
+Main Evaluation Module for Nurdle Detection Pipeline
+===================================================
 
-This module provides detailed evaluation metrics, visualization, and analysis
-for trained models including window-level and image-level performance metrics.
+This module handles the complete evaluation process for trained models,
+including prediction, coordinate matching, and metrics calculation.
 """
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 import json
 import logging
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Tuple, Any, Optional, Union
-from collections import defaultdict
+from typing import Dict, List, Tuple, Any, Optional, Callable
+import numpy as np
 
-from sklearn.metrics import (
-    classification_report, confusion_matrix, roc_auc_score, roc_curve,
-    precision_recall_curve, average_precision_score, f1_score,
-    precision_score, recall_score, accuracy_score
-)
-
-from ..utils.config import ConfigLoader
-from ..training.bbox_regressor import BoundingBoxRegressor
-from .nms_processor import NonMaximumSuppression
-from .test_loader import TestSetLoader
-from .threshold_optimizer import ThresholdOptimizer
-from .evaluation_visualizer import EvaluationVisualizer
-
-logger = logging.getLogger(__name__)
+from .metrics import EvaluationMetrics, CoordinateMatching
+from .nms import NonMaximumSuppression
 
 
 class ModelEvaluator:
     """
-    Comprehensive model evaluation with multiple metrics and visualizations.
+    Main evaluator for nurdle detection models.
     
-    Provides:
-    - Window-level classification metrics
-    - Image-level aggregated metrics  
-    - ROC and PR curve analysis
-    - Confusion matrix visualization
-    - Performance comparison across models
+    Handles evaluation of both classification (count prediction) and
+    coordinate prediction tasks.
     """
     
-    def __init__(self, config: ConfigLoader):
-        """
-        Initialize evaluator.
-        
-        Args:
-            config: Configuration loader instance
-        """
-        self.config = config
-        
-        # Evaluation configuration
-        eval_config = config.get_section('evaluation')
-        self.metrics_config = eval_config.get('metrics', {})
-        self.visualization_config = eval_config.get('visualization', {})
-        self.detection_config = eval_config.get('detection', {})
-        
-        # Initialize helper classes
-        self.test_loader = TestSetLoader(config)
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        """Initialize evaluator with optional logger."""
+        self.logger = logger or logging.getLogger(__name__)
+        self.metrics_calculator = EvaluationMetrics()
+        self.coordinate_matcher = CoordinateMatching()
         self.nms = NonMaximumSuppression()
-        self.threshold_optimizer = ThresholdOptimizer(config)
         
-        # Paths
-        self.figures_dir = Path(config.get('paths.output_dir')) / config.get('paths.figures_dir')
-        self.figures_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize visualizer
-        self.visualizer = EvaluationVisualizer(self.figures_dir, self.visualization_config)
-        
-        # Results storage
-        self.evaluation_results = {}
-        
-        logger.info("Model evaluator initialized with NMS and threshold optimization")
-    
-    def evaluate_single_model(self,
-                             model_package: Dict[str, Any],
-                             test_features: np.ndarray,
-                             test_labels: np.ndarray,
-                             model_name: str) -> Dict[str, Any]:
+    def evaluate_models(self, 
+                       test_annotations: List[Any],
+                       predict_image_func: Callable[[str], Tuple[int, List[Tuple[float, float]]]]) -> Dict[str, float]:
         """
-        Evaluate a single trained model.
+        Evaluate models on test set.
         
         Args:
-            model_package: Trained model package
-            test_features: Test feature matrix
-            test_labels: Test labels
-            model_name: Name identifier for model
-            
+            test_annotations: List of ImageAnnotation objects for testing
+            predict_image_func: Function that takes image_path and returns (count, coordinates)
+        
         Returns:
-            Dictionary containing comprehensive evaluation results
+            Dictionary of evaluation metrics
         """
-        logger.info(f"Evaluating {model_name} model")
+        self.logger.info("Evaluating models...")
         
-        model = model_package['model']
-        scaler = model_package['scaler']
-        
-        # Scale test features
-        scaled_features = scaler.transform(test_features)
-        
-        # Predictions
-        predictions = model.predict(scaled_features)
-        
-        # Get decision scores (for threshold optimization)
-        decision_scores = None
-        probabilities = None
-        
-        try:
-            if hasattr(model, 'decision_function'):
-                decision_scores = model.decision_function(scaled_features)
-                probabilities = decision_scores  # Use decision scores as probabilities
-            elif hasattr(model, 'predict_proba'):
-                probabilities = model.predict_proba(scaled_features)[:, 1]
-                decision_scores = probabilities
-        except Exception as e:
-            logger.warning(f"Could not get decision scores: {e}")
-        
-        # Optimize decision threshold
-        if decision_scores is not None:
-            threshold_results = self.threshold_optimizer.optimize_threshold(
-                test_labels, decision_scores, metric='f1'
-            )
-            optimal_threshold = threshold_results['optimal_threshold']
-            
-            # Make predictions with optimal threshold
-            optimized_predictions = (decision_scores >= optimal_threshold).astype(int)
-        else:
-            threshold_results = {'optimal_threshold': 0.0, 'optimal_score': 0.0, 'method': 'default'}
-            optimized_predictions = predictions
-            optimal_threshold = 0.0
-        
-        # Basic classification metrics (with default threshold)
-        default_metrics = self._calculate_classification_metrics(test_labels, predictions, probabilities)
-        
-        # Optimized metrics (with optimal threshold)  
-        optimized_metrics = self._calculate_classification_metrics(test_labels, optimized_predictions, probabilities)
-        
-        # Use optimized metrics as primary metrics
-        metrics = optimized_metrics
-        
-        # Detailed classification report
-        report = classification_report(test_labels, predictions, output_dict=True)
-        
-        # Confusion matrix
-        cm = confusion_matrix(test_labels, predictions)
-        
-        # Compile results
-        results = {
-            'model_name': model_name,
-            'metrics': metrics,
-            'default_metrics': default_metrics,
-            'optimized_metrics': optimized_metrics,
-            'threshold_optimization': threshold_results,
-            'optimal_threshold': optimal_threshold,
-            'classification_report': report,
-            'confusion_matrix': cm.tolist(),
-            'predictions': predictions.tolist(),
-            'optimized_predictions': optimized_predictions.tolist(),
-            'test_labels': test_labels.tolist(),
-            'probabilities': probabilities.tolist() if probabilities is not None else None,
-            'decision_scores': decision_scores.tolist() if decision_scores is not None else None,
-            'test_samples': len(test_labels),
-            'positive_samples': int(np.sum(test_labels)),
-            'negative_samples': int(len(test_labels) - np.sum(test_labels)),
-            'evaluation_timestamp': datetime.now().isoformat()
+        count_predictions = []
+        count_ground_truth = []
+        coordinate_errors = []
+        detection_stats = {
+            'true_positives': 0,
+            'false_positives': 0,
+            'false_negatives': 0
         }
         
-        # Store results
-        self.evaluation_results[model_name] = results
-        
-        logger.info(f"{model_name} evaluation completed - F1: {metrics['f1_score']:.4f}")
-        
-        return results
-    
-    def _calculate_classification_metrics(self,
-                                        y_true: np.ndarray,
-                                        y_pred: np.ndarray,
-                                        y_prob: Optional[np.ndarray] = None) -> Dict[str, float]:
-        """
-        Calculate comprehensive classification metrics.
-        
-        Args:
-            y_true: True labels
-            y_pred: Predicted labels
-            y_prob: Prediction probabilities (optional)
-            
-        Returns:
-            Dictionary of metrics
-        """
-        metrics = {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'precision': precision_score(y_true, y_pred, zero_division=0),
-            'recall': recall_score(y_true, y_pred, zero_division=0),
-            'f1_score': f1_score(y_true, y_pred, zero_division=0),
-        }
-        
-        # Add probability-based metrics if available
-        if y_prob is not None:
+        for annotation in test_annotations:
             try:
-                metrics['roc_auc'] = roc_auc_score(y_true, y_prob)
-                metrics['average_precision'] = average_precision_score(y_true, y_prob)
-            except ValueError:
-                # Handle cases where only one class is present
-                metrics['roc_auc'] = None
-                metrics['average_precision'] = None
-        else:
-            metrics['roc_auc'] = None
-            metrics['average_precision'] = None
+                predicted_count, predicted_coords = predict_image_func(annotation.image_path)
+                actual_count = annotation.nurdle_count
+                actual_coords = annotation.coordinates
+                
+                count_predictions.append(predicted_count)
+                count_ground_truth.append(actual_count)
+                
+                # Calculate coordinate matching and detection statistics
+                # Convert coordinates to list format for matching
+                actual_coords_list = actual_coords.tolist() if hasattr(actual_coords, 'tolist') else list(actual_coords)
+                
+                if len(actual_coords_list) > 0 or len(predicted_coords) > 0:
+                    coord_errors, tp, fp, fn = self.coordinate_matcher.match_coordinates(
+                        predicted_coords, actual_coords_list
+                    )
+                    
+                    coordinate_errors.extend(coord_errors)
+                    detection_stats['true_positives'] += tp
+                    detection_stats['false_positives'] += fp
+                    detection_stats['false_negatives'] += fn
+                
+            except Exception as e:
+                self.logger.error(f"Error evaluating {annotation.image_path}: {e}")
+                continue
         
-        # Custom metrics from config
-        if self.metrics_config.get('calculate_mape', False):
-            metrics['mape'] = self._calculate_mape(y_true, y_pred)
+        # Calculate comprehensive metrics
+        metrics = self.metrics_calculator.calculate_all_metrics(
+            count_ground_truth=count_ground_truth,
+            count_predictions=count_predictions,
+            coordinate_errors=coordinate_errors,
+            detection_stats=detection_stats,
+            n_test_images=len(test_annotations)
+        )
         
-        if self.metrics_config.get('calculate_mae', False):
-            metrics['mae'] = self._calculate_mae(y_true, y_pred)
+        # Log results
+        self._log_evaluation_results(metrics)
         
         return metrics
     
-    def _calculate_mape(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    def evaluate_single_image(self,
+                            image_path: str,
+                            ground_truth_coords: List[Tuple[float, float]],
+                            predict_image_func: Callable[[str], Tuple[int, List[Tuple[float, float]]]],
+                            match_threshold: float = 25.0) -> Dict[str, Any]:
         """
-        Calculate Mean Absolute Percentage Error.
+        Evaluate model performance on a single image.
         
         Args:
-            y_true: True values
-            y_pred: Predicted values
+            image_path: Path to image file
+            ground_truth_coords: List of (x, y) ground truth coordinates
+            predict_image_func: Function that takes image_path and returns (count, coordinates)
+            match_threshold: Maximum distance for matching coordinates (pixels)
             
         Returns:
-            MAPE value
+            Dictionary containing detailed evaluation results for this image
         """
-        # For binary classification, treat as 0/1 and avoid division by zero
-        mask = y_true != 0
-        if np.sum(mask) == 0:
-            return 0.0
-        
-        return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
-    
-    def _calculate_mae(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
-        """
-        Calculate Mean Absolute Error.
-        
-        Args:
-            y_true: True values
-            y_pred: Predicted values
-            
-        Returns:
-            MAE value
-        """
-        return float(np.mean(np.abs(y_true - y_pred)))
-    
-    def _apply_bbox_refinement(self,
-                              detections: List[Dict[str, Any]],
-                              features: np.ndarray,
-                              bbox_regressor: Optional[BoundingBoxRegressor],
-                              confidence_threshold: float = 0.5) -> List[Dict[str, Any]]:
-        """
-        Apply bounding box regression to refine detection windows.
-        
-        Uses trained regressor to predict offset and scale adjustments,
-        transforming crude sliding window detections into tight-fitting boxes.
-        
-        Args:
-            detections: List of detection dicts with 'bbox', 'score', 'window_idx'
-            features: Feature vectors for all windows (N × D)
-            bbox_regressor: Trained BoundingBoxRegressor instance (or None)
-            confidence_threshold: Minimum confidence to apply refinement
-            
-        Returns:
-            List of detections with refined 'bbox' coordinates
-        """
-        if bbox_regressor is None or bbox_regressor.regressor is None:
-            logger.debug("No trained bbox regressor - skipping refinement")
-            return detections
-        
-        if not detections:
-            return detections
-        
-        logger.info(f"Applying bbox refinement to {len(detections)} detections")
-        
-        # Extract window indices and features for detections
-        detection_indices = [det.get('window_idx', -1) for det in detections]
-        
-        # Filter out detections without window indices
-        valid_detections = []
-        valid_indices = []
-        for det, idx in zip(detections, detection_indices):
-            if idx >= 0 and idx < len(features):
-                valid_detections.append(det)
-                valid_indices.append(idx)
-        
-        if not valid_detections:
-            logger.warning("No valid window indices for bbox refinement")
-            return detections
-        
-        # Get features for valid detections
-        detection_features = features[valid_indices]
-        
-        # Prepare detection list for regressor
-        detection_list = [
-            {
-                'bbox': det['bbox'],
-                'score': det['score'],
-                'label': det.get('label', det.get('prediction', 1))
-            }
-            for det in valid_detections
-        ]
-        
-        # Apply refinement
         try:
-            refined_detections = bbox_regressor.refine_detections(
-                detection_list,
-                detection_features,
-                min_confidence=confidence_threshold
+            predicted_count, predicted_coords = predict_image_func(image_path)
+            actual_count = len(ground_truth_coords)
+            
+            # Match coordinates and calculate errors
+            coord_errors, tp, fp, fn = self.coordinate_matcher.match_coordinates(
+                predicted_coords, ground_truth_coords, match_threshold
             )
             
-            # Update original detection bboxes
-            for i, refined_det in enumerate(refined_detections):
-                valid_detections[i]['bbox'] = refined_det['bbox']
-                valid_detections[i]['refined'] = True
+            # Calculate basic metrics for this image
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
             
-            logger.info(f"Successfully refined {len(refined_detections)} bounding boxes")
+            results = {
+                'image_path': image_path,
+                'predicted_count': predicted_count,
+                'actual_count': actual_count,
+                'count_error': abs(predicted_count - actual_count),
+                'coordinate_errors': coord_errors,
+                'avg_coordinate_error': np.mean(coord_errors) if coord_errors else 0.0,
+                'true_positives': tp,
+                'false_positives': fp,
+                'false_negatives': fn,
+                'precision': precision,
+                'recall': recall,
+                'f1_score': f1_score,
+                'predicted_coords': predicted_coords,
+                'ground_truth_coords': ground_truth_coords
+            }
+            
+            return results
             
         except Exception as e:
-            logger.error(f"Bbox refinement failed: {e}")
-            # Return original detections on error
-            return detections
-        
-        return valid_detections
-    
-    def evaluate_image_level_performance(self,
-                                       model_results: Dict[str, Dict[str, Any]],
-                                       window_metadata: Optional[Dict[str, Any]] = None,
-                                       bbox_regressors: Optional[Dict[str, BoundingBoxRegressor]] = None,
-                                       test_features: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, Dict[str, Any]]:
-        """
-        Evaluate performance at image level by aggregating window predictions with NMS.
-        
-        Args:
-            model_results: Results from window-level evaluation
-            window_metadata: Window-to-image mapping metadata
-            bbox_regressors: Optional dict of bbox regressors by feature type
-            test_features: Optional dict of test features by feature type
-            
-        Returns:
-            Image-level evaluation results with proper aggregation
-        """
-        logger.info("Calculating image-level performance with proper window aggregation")
-        
-        # Load test set with metadata if not provided
-        if window_metadata is None:
-            test_set_info = self.test_loader.load_test_set_features_and_metadata()
-            window_metadata = test_set_info.get('window_metadata', {})
-        
-        # Ensure window_metadata is a dict
-        if window_metadata is None:
-            window_metadata = {}
-        
-        image_level_results = {}
-        nms_threshold = self.detection_config.get('iou_threshold', 0.5)
-        
-        for model_name, results in model_results.items():
-            if 'error' in results:
-                continue
-                
-            # Use optimized predictions if available
-            predictions = np.array(results.get('optimized_predictions', results['predictions']))
-            true_labels = np.array(results['test_labels'])
-            decision_scores = results.get('decision_scores')
-            
-            if decision_scores is not None:
-                decision_scores = np.array(decision_scores)
-            
-            # Get window metadata for this feature type
-            feature_type = model_name
-            metadata = window_metadata.get(feature_type, {})
-            window_to_image = metadata.get('window_to_image', {})
-            
-            if not window_to_image:
-                # Fallback to simulated grouping
-                logger.warning(f"No window metadata for {model_name}, using simulated grouping")
-                image_level_results[model_name] = self._simulate_image_level_evaluation(
-                    predictions, true_labels, decision_scores
-                )
-                continue
-            
-            # Group predictions by image
-            image_groups = defaultdict(list)
-            
-            for window_idx in range(len(predictions)):
-                window_info = window_to_image.get(str(window_idx), {})
-                image_id = window_info.get('image_id', f'unknown_image_{window_idx // 20}')
-                
-                detection = {
-                    'prediction': predictions[window_idx],
-                    'true_label': true_labels[window_idx],
-                    'score': decision_scores[window_idx] if decision_scores is not None else predictions[window_idx],
-                    'window_index': window_idx,
-                    'bbox': [0, 0, 40, 40]  # Simulated bbox for NMS
-                }
-                
-                image_groups[image_id].append(detection)
-            
-            # Evaluate each image
-            image_predictions = []
-            image_labels = []
-            image_counts_pred = []
-            image_counts_true = []
-            
-            for image_id, detections in image_groups.items():
-                # Prepare positive detections
-                positive_detections = [
-                    {
-                        'bbox': det['bbox'],
-                        'score': float(det['score']),
-                        'label': int(det['prediction']),
-                        'window_idx': det['window_index']
-                    }
-                    for det in detections if det['prediction'] == 1
-                ]
-                
-                # Apply bbox refinement if regressor available
-                if bbox_regressors and feature_type in bbox_regressors:
-                    if test_features and feature_type in test_features:
-                        bbox_regressor = bbox_regressors[feature_type]
-                        features = test_features[feature_type]
-                        
-                        positive_detections = self._apply_bbox_refinement(
-                            positive_detections,
-                            features,
-                            bbox_regressor,
-                            confidence_threshold=0.5
-                        )
-                
-                # Apply NMS to detections (potentially refined)
-                filtered_detections = self.nms.apply_nms(positive_detections, nms_threshold)
-                
-                # Count predictions and ground truth
-                pred_count = len(filtered_detections)
-                true_count = sum(det['true_label'] for det in detections)
-                
-                # Image-level binary classification (any detection = positive)
-                image_pred = 1 if pred_count > 0 else 0
-                image_true = 1 if true_count > 0 else 0
-                
-                image_predictions.append(image_pred)
-                image_labels.append(image_true)
-                image_counts_pred.append(pred_count)
-                image_counts_true.append(true_count)
-            
-            # Calculate image-level binary metrics
-            image_metrics = self._calculate_classification_metrics(
-                np.array(image_labels),
-                np.array(image_predictions)
-            )
-            
-            # Calculate count-based metrics (MAPE, MAE)
-            if image_counts_true:
-                mae = float(np.mean(np.abs(np.array(image_counts_pred) - np.array(image_counts_true))))
-                
-                # Calculate MAPE (handle division by zero)
-                percentage_errors = []
-                for pred, true in zip(image_counts_pred, image_counts_true):
-                    if true > 0:
-                        percentage_errors.append(abs((pred - true) / true))
-                
-                mape = float(np.mean(percentage_errors) * 100) if percentage_errors else 0.0
-                
-                image_metrics['mae'] = mae
-                image_metrics['mape'] = mape
-            
-            image_level_results[model_name] = {
-                'metrics': image_metrics,
-                'predictions': image_predictions,
-                'labels': image_labels,
-                'count_predictions': image_counts_pred,
-                'count_labels': image_counts_true,
-                'n_images': len(image_groups),
-                'aggregation_method': 'NMS',
-                'nms_threshold': nms_threshold
+            self.logger.error(f"Error evaluating single image {image_path}: {e}")
+            return {
+                'image_path': image_path,
+                'error': str(e)
             }
-            
-            logger.info(f"{model_name} image-level F1: {image_metrics.get('f1_score', 0):.4f}, "
-                       f"MAE: {image_metrics.get('mae', 0):.2f}, MAPE: {image_metrics.get('mape', 0):.2f}%")
-        
-        return image_level_results
     
-    def _simulate_image_level_evaluation(self, predictions, true_labels, decision_scores):
-        """Fallback method for simulated image-level evaluation."""
-        n_images = self.metrics_config.get('simulated_images', 10)
-        windows_per_image = len(predictions) // n_images
-        
-        image_level_preds = []
-        image_level_labels = []
-        
-        for i in range(n_images):
-            start_idx = i * windows_per_image
-            end_idx = (i + 1) * windows_per_image if i < n_images - 1 else len(predictions)
-            
-            window_preds = predictions[start_idx:end_idx]
-            window_labels = true_labels[start_idx:end_idx]
-            
-            # Image is positive if any window is positive (OR aggregation)
-            image_pred = 1 if np.any(window_preds) else 0
-            image_label = 1 if np.any(window_labels) else 0
-            
-            image_level_preds.append(image_pred)
-            image_level_labels.append(image_label)
-        
-        # Calculate image-level metrics
-        image_metrics = self._calculate_classification_metrics(
-            np.array(image_level_labels),
-            np.array(image_level_preds)
-        )
-        
-        return {
-            'metrics': image_metrics,
-            'predictions': image_level_preds,
-            'labels': image_level_labels,
-            'n_images': n_images,
-            'aggregation_method': 'OR_simulation'
-        }
-    
-    def compare_models(self, model_results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    def save_evaluation_results(self, 
+                              metrics: Dict[str, float], 
+                              output_dir: str,
+                              filename: str = "evaluation_results.json") -> None:
         """
-        Compare performance across multiple models.
+        Save evaluation results to organized folder structure.
         
         Args:
-            model_results: Results from multiple model evaluations
-            
-        Returns:
-            Model comparison results
+            metrics: Dictionary of evaluation metrics
+            output_dir: Output directory path
+            filename: Output filename (default: "evaluation_results.json")
         """
-        logger.info("Comparing model performance")
+        output_path = Path(output_dir)
         
-        comparison_data = []
+        # Save evaluation results to evaluations subfolder
+        evaluations_dir = output_path / "evaluations"
+        evaluations_dir.mkdir(parents=True, exist_ok=True)
         
-        for model_name, results in model_results.items():
-            if 'error' in results:
-                continue
-                
-            metrics = results['metrics']
-            comparison_data.append({
-                'model': model_name,
-                'accuracy': metrics.get('accuracy', 0),
-                'precision': metrics.get('precision', 0),
-                'recall': metrics.get('recall', 0),
-                'f1_score': metrics.get('f1_score', 0),
-                'roc_auc': metrics.get('roc_auc', 0),
-                'average_precision': metrics.get('average_precision', 0)
-            })
+        results_path = evaluations_dir / filename
         
-        comparison_df = pd.DataFrame(comparison_data)
+        # Convert numpy types to Python types for JSON serialization
+        serializable_metrics = {}
+        for key, value in metrics.items():
+            if isinstance(value, np.ndarray):
+                serializable_metrics[key] = value.tolist()
+            elif isinstance(value, (np.integer, np.floating)):
+                serializable_metrics[key] = float(value)
+            else:
+                serializable_metrics[key] = value
         
-        # Find best model for each metric
-        best_models = {}
-        for metric in ['accuracy', 'precision', 'recall', 'f1_score', 'roc_auc', 'average_precision']:
-            if metric in comparison_df.columns:
-                best_idx = comparison_df[metric].idxmax()
-                if pd.notna(comparison_df.loc[best_idx, metric]):
-                    best_models[metric] = {
-                        'model': comparison_df.loc[best_idx, 'model'],
-                        'value': comparison_df.loc[best_idx, metric]
-                    }
+        with open(results_path, 'w') as f:
+            json.dump(serializable_metrics, f, indent=2)
         
-        # Calculate ranking
-        ranking_cols = ['f1_score', 'accuracy', 'precision', 'recall']
-        available_cols = [col for col in ranking_cols if col in comparison_df.columns]
-        
-        if available_cols:
-            comparison_df['overall_score'] = comparison_df[available_cols].mean(axis=1)
-            comparison_df = comparison_df.sort_values('overall_score', ascending=False)
-        
-        comparison_results = {
-            'comparison_table': comparison_df.to_dict('records'),
-            'best_models': best_models,
-            'model_ranking': comparison_df['model'].tolist() if 'overall_score' in comparison_df.columns else []
-        }
-        
-        return comparison_results
+        self.logger.info(f"Saved evaluation results to {results_path}")
     
-    def create_visualizations(self, model_results: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    def save_detailed_results(self,
+                            detailed_results: List[Dict[str, Any]],
+                            output_dir: str,
+                            filename: str = "detailed_evaluation.json") -> None:
         """
-        Create comprehensive evaluation visualizations.
-        
-        Delegates to EvaluationVisualizer for all visualization generation.
+        Save detailed per-image evaluation results.
         
         Args:
-            model_results: Results from model evaluations
-            
-        Returns:
-            Dictionary mapping visualization names to file paths
+            detailed_results: List of per-image evaluation dictionaries
+            output_dir: Output directory path
+            filename: Output filename (default: "detailed_evaluation.json")
         """
-        return self.visualizer.create_all_visualizations(model_results)
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        results_path = output_path / filename
+        
+        # Convert numpy types for JSON serialization
+        serializable_results = []
+        for result in detailed_results:
+            serializable_result = {}
+            for key, value in result.items():
+                if isinstance(value, np.ndarray):
+                    serializable_result[key] = value.tolist()
+                elif isinstance(value, (np.integer, np.floating)):
+                    serializable_result[key] = float(value)
+                elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], tuple):
+                    # Handle coordinate tuples
+                    serializable_result[key] = [list(coord) for coord in value]
+                else:
+                    serializable_result[key] = value
+            serializable_results.append(serializable_result)
+        
+        with open(results_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        self.logger.info(f"Saved detailed evaluation results to {results_path}")
     
-
-
-    
-    def save_evaluation_report(self, 
-                              model_results: Dict[str, Dict[str, Any]],
-                              image_level_results: Optional[Dict[str, Dict[str, Any]]] = None,
-                              visualization_paths: Optional[Dict[str, str]] = None) -> str:
+    def generate_evaluation_report(self, 
+                                 metrics: Dict[str, float],
+                                 output_dir: str) -> str:
         """
-        Save comprehensive evaluation report.
+        Generate a human-readable evaluation report in organized folder structure.
         
         Args:
-            model_results: Window-level evaluation results
-            image_level_results: Optional image-level evaluation results
-            visualization_paths: Optional paths to generated visualizations
+            metrics: Dictionary of evaluation metrics
+            output_dir: Output directory path
             
         Returns:
-            Path to saved report file
+            Path to generated report file
         """
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        report_path = self.figures_dir / f'evaluation_report_{timestamp}.json'
+        output_path = Path(output_dir)
         
-        # Compile complete report
-        report = {
-            'evaluation_summary': {
-                'timestamp': datetime.now().isoformat(),
-                'total_models_evaluated': len([r for r in model_results.values() if 'error' not in r]),
-                'failed_models': len([r for r in model_results.values() if 'error' in r])
-            },
-            'window_level_results': model_results,
-            'model_comparison': self.compare_models(model_results)
-        }
+        # Save evaluation report to evaluations subfolder
+        evaluations_dir = output_path / "evaluations"
+        evaluations_dir.mkdir(parents=True, exist_ok=True)
         
-        if image_level_results:
-            report['image_level_results'] = image_level_results
+        report_path = evaluations_dir / "evaluation_report.txt"
         
-        if visualization_paths:
-            report['visualizations'] = visualization_paths
-        
-        # Save report
         with open(report_path, 'w') as f:
-            json.dump(report, f, indent=2, default=str)
+            f.write("Nurdle Detection Pipeline - Evaluation Report\n")
+            f.write("=" * 50 + "\n\n")
+            
+            f.write("COUNT PREDICTION METRICS:\n")
+            f.write(f"  Accuracy: {metrics.get('count_accuracy', 0):.3f}\n")
+            f.write(f"  Mean Absolute Error: {metrics.get('count_mae', 0):.3f}\n")
+            f.write(f"  Root Mean Square Error: {metrics.get('count_rmse', 0):.3f}\n\n")
+            
+            f.write("COORDINATE PREDICTION METRICS:\n")
+            f.write(f"  Average Coordinate Error: {metrics.get('avg_coordinate_error', 0):.1f} pixels\n")
+            f.write(f"  Median Coordinate Error: {metrics.get('median_coordinate_error', 0):.1f} pixels\n")
+            f.write(f"  Max Coordinate Error: {metrics.get('max_coordinate_error', 0):.1f} pixels\n\n")
+            
+            f.write("DETECTION METRICS:\n")
+            f.write(f"  Precision: {metrics.get('precision', 0):.3f}\n")
+            f.write(f"  Recall: {metrics.get('recall', 0):.3f}\n")
+            f.write(f"  F1-Score: {metrics.get('f1_score', 0):.3f}\n\n")
+            
+            f.write("DATASET INFORMATION:\n")
+            f.write(f"  Test Images: {metrics.get('n_test_images', 0)}\n")
+            f.write(f"  True Positives: {metrics.get('true_positives', 0)}\n")
+            f.write(f"  False Positives: {metrics.get('false_positives', 0)}\n")
+            f.write(f"  False Negatives: {metrics.get('false_negatives', 0)}\n")
         
-        logger.info(f"Evaluation report saved: {report_path}")
+        self.logger.info(f"Generated evaluation report: {report_path}")
         return str(report_path)
     
-    def generate_summary_statistics(self, model_results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    def save_comparison_results(self,
+                               main_metrics: Dict[str, float],
+                               stacked_metrics: Dict[str, float],
+                               comparison: Dict[str, float],
+                               output_dir: str) -> None:
         """
-        Generate summary statistics across all models.
+        Save side-by-side comparison results.
         
         Args:
-            model_results: Results from all model evaluations
-            
-        Returns:
-            Summary statistics dictionary
+            main_metrics: Metrics from main pipeline
+            stacked_metrics: Metrics from stacked model
+            comparison: Improvement metrics
+            output_dir: Output directory
         """
-        successful_results = {k: v for k, v in model_results.items() if 'error' not in v}
+        output_path = Path(output_dir)
+        evaluations_dir = output_path / "evaluations"
+        evaluations_dir.mkdir(parents=True, exist_ok=True)
         
-        if not successful_results:
-            return {'error': 'No successful model evaluations found'}
-        
-        # Collect all metrics
-        all_metrics = defaultdict(list)
-        
-        for results in successful_results.values():
-            metrics = results['metrics']
-            for metric_name, value in metrics.items():
-                if value is not None:
-                    all_metrics[metric_name].append(value)
-        
-        # Calculate statistics
-        summary_stats = {}
-        
-        for metric_name, values in all_metrics.items():
-            if values:
-                summary_stats[metric_name] = {
-                    'mean': np.mean(values),
-                    'std': np.std(values),
-                    'min': np.min(values),
-                    'max': np.max(values),
-                    'median': np.median(values)
-                }
-        
-        # Add model count information
-        summary_stats['model_counts'] = {
-            'total_evaluated': len(model_results),
-            'successful': len(successful_results),
-            'failed': len(model_results) - len(successful_results)
+        # Save combined results
+        combined_results = {
+            'main_pipeline': main_metrics,
+            'stacked_model': stacked_metrics,
+            'comparison': comparison
         }
         
-        return summary_stats
+        results_path = evaluations_dir / "comparison_results.json"
+        with open(results_path, 'w') as f:
+            json.dump(combined_results, f, indent=2)
+        
+        self.logger.info(f"Saved comparison results to {results_path}")
+        
+        # Generate comparison report
+        self.generate_comparison_report(combined_results, output_dir)
+    
+    def generate_comparison_report(self,
+                                  results: Dict[str, Any],
+                                  output_dir: str) -> str:
+        """
+        Generate human-readable comparison report.
+        
+        Args:
+            results: Combined results dictionary
+            output_dir: Output directory
+            
+        Returns:
+            Path to generated report
+        """
+        output_path = Path(output_dir)
+        evaluations_dir = output_path / "evaluations"
+        evaluations_dir.mkdir(parents=True, exist_ok=True)
+        
+        report_path = evaluations_dir / "comparison_report.txt"
+        
+        main = results['main_pipeline']
+        stacked = results['stacked_model']
+        comp = results['comparison']
+        
+        with open(report_path, 'w') as f:
+            f.write("Nurdle Detection Pipeline - Model Comparison Report\n")
+            f.write("=" * 60 + "\n\n")
+            
+            f.write("MAIN PIPELINE (SVM + SVR):\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"  F1-Score: {main['f1_score']:.3f}\n")
+            f.write(f"  Precision: {main['precision']:.3f}\n")
+            f.write(f"  Recall: {main['recall']:.3f}\n")
+            f.write(f"  Avg Coordinate Error: {main['avg_coordinate_error']:.1f} pixels\n")
+            f.write(f"  Count MAE: {main['count_mae']:.1f}\n\n")
+            
+            f.write("STACKED MODEL (SVM + SVR + Meta-Learner):\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"  F1-Score: {stacked['f1_score']:.3f}\n")
+            f.write(f"  Precision: {stacked['precision']:.3f}\n")
+            f.write(f"  Recall: {stacked['recall']:.3f}\n")
+            f.write(f"  Avg Coordinate Error: {stacked['avg_coordinate_error']:.1f} pixels\n")
+            f.write(f"  Count MAE: {stacked['count_mae']:.1f}\n\n")
+            
+            f.write("IMPROVEMENT (Stacked vs Main):\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"  F1-Score: {comp['f1_improvement']:+.3f} ({comp['f1_improvement']/main['f1_score']*100:+.1f}%)\n")
+            f.write(f"  Precision: {comp['precision_improvement']:+.3f}\n")
+            f.write(f"  Recall: {comp['recall_improvement']:+.3f}\n")
+            f.write(f"  Coordinate Error: {comp['coord_error_improvement']:+.1f} pixels\n\n")
+            
+            # Determine winner
+            if comp['f1_improvement'] > 0.01 and comp['coord_error_improvement'] > 0.5:
+                winner = "Stacked Model (significant improvement)"
+            elif comp['f1_improvement'] < -0.01 or comp['coord_error_improvement'] < -0.5:
+                winner = "Main Pipeline (stacking degraded performance)"
+            else:
+                winner = "Similar performance (no clear winner)"
+            
+            f.write(f"CONCLUSION: {winner}\n")
+        
+        self.logger.info(f"Generated comparison report: {report_path}")
+        return str(report_path)
+    
+    def _log_evaluation_results(self, metrics: Dict[str, float]) -> None:
+        """Log evaluation results to console."""
+        self.logger.info("Evaluation Results:")
+        self.logger.info(f"  Count Accuracy: {metrics.get('count_accuracy', 0):.3f}")
+        self.logger.info(f"  Count MAE: {metrics.get('count_mae', 0):.3f}")
+        self.logger.info(f"  Avg Coordinate Error: {metrics.get('avg_coordinate_error', 0):.1f} pixels")
+        self.logger.info(f"  Precision: {metrics.get('precision', 0):.3f}")
+        self.logger.info(f"  Recall: {metrics.get('recall', 0):.3f}")
+        self.logger.info(f"  F1-Score: {metrics.get('f1_score', 0):.3f}")
