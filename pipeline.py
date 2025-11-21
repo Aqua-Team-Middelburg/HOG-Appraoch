@@ -1,41 +1,44 @@
 #!/usr/bin/env python3
 """
-Nurdle Detection Pipeline - Main Entry Point
-===========================================
+Nurdle Detection Pipeline - Modular Step-by-Step Execution
+==========================================================
 
-Clean, organized pipeline for nurdle detection and localization.
+Modular pipeline with checkpoint-based stages and intermediate outputs.
 
-Key features:
-- RAM-friendly batch processing (15 images at a time)
-- Two-stage detection: SVM Classifier → SVR Regressor
-- Combined HOG+LBP features
-- Optional stacking meta-learner for improved accuracy
-- Modular, maintainable code structure
+Features:
+- Step-by-step execution via --steps flag
+- Checkpoint save/load for normalized data and windows
+- Intermediate visualizations for each stage
+- Progress tracking with tqdm
+- Enhanced error checking and logging
 
 Usage:
-    python pipeline.py                    # Run with default config.yaml
-    python pipeline.py --config custom.yaml
-    python pipeline.py --input input_dir --output output_dir
+    python pipeline.py --steps normalization,windows,features,tuning,training,evaluation
+    python pipeline.py --steps normalization              # Run only normalization
+    python pipeline.py --steps training,evaluation        # Skip to training if checkpoints exist
+    python pipeline.py --clean-temp                       # Clean temporary files
 
 Author: Aqua Team Middelburg  
-Version: 2.0.0 (Refactored)
+Version: 3.0.0 (Modular Pipeline)
 """
 
 import argparse
 import logging
 import sys
-import numpy as np
+import shutil
+import cv2
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
+from datetime import datetime
 
 # Import pipeline components
 try:
     from src.utils.config import load_config
-    from src.utils.visualizer import PipelineVisualizer
     from src.data import DataLoader
     from src.features import FeatureExtractor
-    from src.models import ModelTrainer, StackedNurdleDetector
+    from src.models import ModelTrainer
     from src.evaluation import ModelEvaluator
+    from tqdm import tqdm
 except ImportError as e:
     print(f"Error importing pipeline components: {e}")
     print("Make sure all src modules are properly installed")
@@ -44,42 +47,67 @@ except ImportError as e:
 
 class NurdlePipeline:
     """
-    Main pipeline orchestrator for nurdle detection.
+    Modular pipeline orchestrator with checkpoint-based stage execution.
     
-    Coordinates data loading, feature extraction, model training, and evaluation.
+    Each stage produces intermediate outputs and can be run independently.
     """
+    
+    # Define available stages
+    AVAILABLE_STAGES = ['normalization', 'windows', 'features', 'tuning', 'training', 'evaluation']
     
     def __init__(self, config_path: str):
         """Initialize pipeline with configuration."""
-        self.config = load_config(config_path)
+        self.config_path = config_path
+        self.config = None
         self.logger = self._setup_logging()
         
-        # Initialize components with proper configuration
-        self.data_loader = DataLoader(self.config.data)
+        # Define checkpoint and output directories
+        self.temp_dir = Path('temp')
+        self.checkpoint_normalized = self.temp_dir / 'normalized'
+        self.checkpoint_windows = self.temp_dir / 'candidate_windows'
         
-        # Combine window and training configs for feature extractor
-        feature_config = {
+        # Stage output directories
+        self.output_dirs = {
+            'normalization': Path('output/01_normalization'),
+            'windows': Path('output/02_windows'),
+            'features': Path('output/03_features'),
+            'tuning': Path('output/04_tuning'),
+            'training': Path('output/05_training'),
+            'evaluation': Path('output/06_evaluation')
+        }
+        
+        # Models directory
+        self.models_dir = Path('output/models')
+        
+        # Initialize components (will be created as needed per stage)
+        self.data_loader = None
+        self.feature_extractor = None
+        self.model_trainer = None
+        self.evaluator = None
+        
+        self.logger.info("Modular pipeline initialized successfully")
+    
+    def _get_feature_config(self) -> Dict[str, Any]:
+        """Get unified feature extractor configuration."""
+        return {
             **self.config.windows,
             **self.config.training,
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4])
         }
-        self.feature_extractor = FeatureExtractor(feature_config)
-        
-        # ModelTrainer needs full config dict (not just training section)
-        # because it accesses confidence.svr_method and other cross-section params
-        self.model_trainer = ModelTrainer(self.config._config)
-        self.evaluator = ModelEvaluator(self.logger)
-        self.visualizer = PipelineVisualizer(self.logger)
-        
-        # Stacked model will be initialized after base models are trained
-        self.stacked_model = None
-        
-        self.logger.info("Pipeline initialized successfully")
+    
+    def _load_checkpoints(self):
+        """Load normalized data checkpoint and initialize feature extractor."""
+        self.data_loader = DataLoader(self.config.data)
+        self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        self.feature_extractor = FeatureExtractor(self._get_feature_config())
     
     def _setup_logging(self):
         """Setup pipeline-specific logging."""
         logs_dir = Path('output/logs')
         logs_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean up old log files, keeping only the last 3
+        self._cleanup_old_logs(logs_dir, keep_last=3)
         
         logger = logging.getLogger('NurdlePipeline')
         logger.setLevel(logging.INFO)
@@ -90,7 +118,8 @@ class NurdlePipeline:
             console_handler.setLevel(logging.INFO)
             
             # File handler
-            file_handler = logging.FileHandler(logs_dir / 'pipeline.log')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            file_handler = logging.FileHandler(logs_dir / f'pipeline_{timestamp}.log')
             file_handler.setLevel(logging.DEBUG)
             
             # Formatter
@@ -105,469 +134,480 @@ class NurdlePipeline:
         
         return logger
     
-    def run_full_pipeline(self, input_dir: str, output_dir: str) -> dict:
-        """
-        Run the complete nurdle detection pipeline - Phase 2 Implementation.
+    def _cleanup_old_logs(self, logs_dir: Path, keep_last: int = 3):
+        """Remove old log files, keeping only the most recent ones."""
+        log_files = sorted(logs_dir.glob('pipeline_*.log'), key=lambda f: f.stat().st_mtime, reverse=True)
         
-        Single command runs everything:
-        1. Image Normalization - Single resolution target  
-        2. Train/Test Split - Simple ratio-based splitting
-        3. Smart Sliding Windows - RAM-friendly batch processing
-        4. Window Labeling - Binary classification with coordinate offsets
-        5. Combined Feature Extraction - RGB HOG + LBP only
-        6. Balanced Sampling - Distance-based negative selection
-        7. Two-Stage Model Training - SVM classifier → SVR regressor
-        8. Evaluation - Standard metrics + coordinate accuracy
+        # Remove older log files beyond keep_last
+        for old_log in log_files[keep_last:]:
+            try:
+                old_log.unlink()
+            except Exception:
+                pass  # Ignore errors during cleanup
+    
+    def _reload_config(self):
+        """Reload configuration from file."""
+        self.logger.debug(f"Reloading configuration from {self.config_path}")
+        self.config = load_config(self.config_path)
+    
+    def _create_stage_output_dir(self, stage: str):
+        """Create and clear stage output directory."""
+        output_dir = self.output_dirs[stage]
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.debug(f"Created output directory: {output_dir}")
+        return output_dir
+    
+    def _check_checkpoint_exists(self, checkpoint_path: Path, stage_name: str, prerequisite: str) -> bool:
+        """Check if required checkpoint exists."""
+        if not checkpoint_path.exists():
+            error_msg = f"ERROR: {stage_name} - Required checkpoint not found: {checkpoint_path}. Run --steps {prerequisite} first."
+            self.logger.error(error_msg)
+            return False
+        return True
+    
+    def run(self, steps: List[str]) -> Dict[str, Any]:
+        """
+        Run specified pipeline stages with checkpoint-based execution.
+        
+        Available stages:
+        - normalization: Load and normalize images, save checkpoints
+        - windows: Generate candidate windows, save checkpoints  
+        - features: Extract and visualize features (no saving)
+        - tuning: Hyperparameter optimization with Optuna
+        - training: Train models and save metrics
+        - evaluation: Comprehensive evaluation with all metrics
         
         Args:
-            input_dir: Directory containing images and JSON annotations
-            output_dir: Directory to save results and models
+            steps: List of stage names to execute
             
         Returns:
-            Evaluation metrics dictionary
+            Dictionary with results from executed stages
         """
-        self.logger.info("=" * 60)
-        self.logger.info("STARTING NURDLE DETECTION PIPELINE")
-        self.logger.info("=" * 60)
+        self.logger.info("=" * 80)
+        self.logger.info(f"STARTING MODULAR PIPELINE - STEPS: {', '.join(steps)}")
+        self.logger.info("=" * 80)
+        
+        results = {}
         
         try:
-            # Step 1: Load and split data
-            self.logger.info("Step 1: Loading data and annotations...")
-            self.data_loader.load_annotations(input_dir)
-            
-            if self.data_loader.num_annotations == 0:
-                raise ValueError("No annotations loaded from input directory")
+            for stage in steps:
+                if stage not in self.AVAILABLE_STAGES:
+                    raise ValueError(f"Unknown stage: {stage}. Available: {self.AVAILABLE_STAGES}")
                 
-            self.data_loader.split_train_test()
-            self.logger.info(f"Loaded {self.data_loader.num_annotations} images: "
-                           f"{self.data_loader.num_train} train, {self.data_loader.num_test} test")
-            
-            # Step 2: Extract features and train models (RAM-efficient batch processing)
-            self.logger.info("Step 2: Extracting features and training models...")
-            self.extract_features_and_train()
-            
-            # Step 3: Optionally train stacked model
-            stacking_enabled = self.config.get('stacking').get('enabled', False)
-            if stacking_enabled:
-                self.logger.info("Step 3: Training stacked ensemble model...")
-                self.train_stacked_model()
-            else:
-                self.logger.info("Step 3: Stacking disabled, skipping ensemble training...")
-            
-            # Step 4: Evaluate models
-            self.logger.info("Step 4: Evaluating trained models...")
-            if stacking_enabled:
-                metrics = self.evaluate_both_models()
-            else:
-                metrics = self.evaluate_main_model()
-            
-            # Step 5: Save results
-            self.logger.info("Step 5: Saving models and results...")
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
-            
-            # Save models
-            self.model_trainer.save_models(output_dir)
-            
-            # Save stacked model if trained
-            if self.stacked_model and hasattr(self.stacked_model, 'is_trained') and self.stacked_model.is_trained:
-                import joblib
-                model_path = output_path / "models" / "stacked_model.joblib"
-                model_path.parent.mkdir(parents=True, exist_ok=True)
-                joblib.dump(self.stacked_model, str(model_path))
-                self.logger.info(f"Stacked model saved to {model_path}")
-            
-            # Save evaluation results
-            self.evaluator.save_evaluation_results(metrics, output_dir)
-            self.evaluator.generate_evaluation_report(metrics, output_dir)
-            
-            # Step 6: Generate visualizations
-            self.logger.info("Step 6: Generating prediction visualizations...")
-            self.generate_visualizations(output_dir, stacking_enabled)
-            
-            self.logger.info("=" * 60)
-            self.logger.info("PIPELINE COMPLETED SUCCESSFULLY")
-            self.logger.info("=" * 60)
-            
-            # Log results based on stacking mode
-            if stacking_enabled:
-                self._log_comparison_results(metrics)
-            else:
-                self._log_final_results(metrics.get('main_pipeline', metrics))
-            
-            return metrics
-            
+                # Reload config before each stage
+                self._reload_config()
+                
+                self.logger.info(f"\n{'='*80}")
+                self.logger.info(f"STAGE: {stage.upper()}")
+                self.logger.info(f"{'='*80}")
+                
+                # Execute stage
+                if stage == 'normalization':
+                    results[stage] = self._run_normalization_stage()
+                elif stage == 'windows':
+                    results[stage] = self._run_windows_stage()
+                elif stage == 'features':
+                    results[stage] = self._run_features_stage()
+                elif stage == 'tuning':
+                    results[stage] = self._run_tuning_stage()
+                elif stage == 'training':
+                    results[stage] = self._run_training_stage()
+                elif stage == 'evaluation':
+                    results[stage] = self._run_evaluation_stage()
+                
+                self.logger.info(f"Stage '{stage}' completed successfully")
+        
         except Exception as e:
-            self.logger.error(f"Pipeline failed: {e}")
+            self.logger.error(f"Pipeline failed at stage '{stage}': {e}", exc_info=True)
             raise
+        
+        self.logger.info("=" * 80)
+        self.logger.info("PIPELINE COMPLETED SUCCESSFULLY")
+        self.logger.info("=" * 80)
+        
+        return results
     
-    def generate_visualizations(self, output_dir: str, stacking_enabled: bool):
-        """Generate prediction visualizations."""
-        # Convert test annotations to format expected by visualizer
-        test_data = {}
-        for annotation in self.data_loader.test_annotations:
-            test_data[annotation.image_path] = {
-                'nurdles': [{'center_x': n.x, 'center_y': n.y} for n in annotation.nurdles]
-            }
+    def _run_normalization_stage(self) -> Dict[str, Any]:
+        """
+        Stage 1: Load images, normalize, and save checkpoints.
         
-        # Create prediction function
-        def predict_func(image_path):
-            return self.predict_image(image_path, use_stacked=False)
+        Outputs:
+        - temp/normalized/ - Checkpoint with normalized images and metadata
+        - output/01_normalization/ - Sample visualizations
+        """
+        output_dir = self._create_stage_output_dir('normalization')
         
-        # Generate visualizations - visualizer handles folder structure
-        self.visualizer.create_batch_visualizations(
-            test_data,
-            predict_func,
-            output_dir  # Pass output_dir directly, not output_dir/visualizations
+        # Initialize data loader
+        input_dir = self.config.data.get('input_dir', 'input')
+        self.data_loader = DataLoader(self.config.data)
+        
+        # Load and process data
+        self.logger.info(f"Loading data from {input_dir}...")
+        self.data_loader.load_annotations(input_dir)
+        
+        if self.data_loader.num_annotations == 0:
+            raise ValueError(f"No annotations loaded from {input_dir}")
+        
+        # Split train/test FIRST (before normalization)
+        self.data_loader.split_train_test()
+        self.logger.info(f"Loaded {self.data_loader.num_annotations} images: "
+                        f"{self.data_loader.num_train} train, {self.data_loader.num_test} test")
+        
+        # THEN normalize and save (normalizes all images, saves split info)
+        self.logger.info("Normalizing and saving all images...")
+        self.data_loader.save_normalized_data(self.checkpoint_normalized)
+        
+        # Generate sample visualizations
+        self.logger.info("Generating normalization visualizations...")
+        self.data_loader.visualize_normalization_samples(self.checkpoint_normalized, output_dir, num_samples=3)
+        
+        return {
+            'total_images': self.data_loader.num_annotations,
+            'train_images': self.data_loader.num_train,
+            'test_images': self.data_loader.num_test,
+            'checkpoint': str(self.checkpoint_normalized)
+        }
+    
+    def _run_windows_stage(self) -> Dict[str, Any]:
+        """
+        Stage 2: Generate candidate windows and save checkpoints.
+        
+        Prerequisites:
+        - temp/normalized/ must exist
+        
+        Outputs:
+        - temp/candidate_windows/ - Checkpoint with window metadata
+        - output/02_windows/ - Sample window visualizations
+        """
+        # Check prerequisites
+        if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Windows', 'normalization'):
+            raise FileNotFoundError(f"ERROR: Windows - Normalized data not found. Run --steps normalization first.")
+        
+        output_dir = self._create_stage_output_dir('windows')
+        
+        # Load checkpoints
+        self.logger.info("Loading checkpoints...")
+        self._load_checkpoints()
+        
+        # Generate windows for all training images
+        self.logger.info("Generating candidate windows...")
+        all_windows = []
+        
+        for annotation in tqdm(self.data_loader.train_annotations, desc="Processing images"):
+            image = self.data_loader.load_image(annotation.image_path)
+            windows = self.feature_extractor.generate_windows_for_image(image, annotation)
+            all_windows.extend(windows)
+        
+        # Save windows checkpoint (implemented in step 3)
+        self.logger.info("Saving windows checkpoint...")
+        self.feature_extractor.save_windows(all_windows, self.checkpoint_windows)
+        
+        # Generate sample visualizations
+        self.logger.info("Generating window visualizations...")
+        self.feature_extractor.visualize_windows_samples(
+            all_windows, self.data_loader, output_dir, num_samples=3
         )
+        
+        return {
+            'total_windows': len(all_windows),
+            'checkpoint': str(self.checkpoint_windows)
+        }
     
-    def _log_comparison_results(self, metrics: dict):
-        """Log comparison results for stacking mode."""
-        main = metrics.get('main_pipeline', {})
-        stacked = metrics.get('stacked_model', {})
-        comp = metrics.get('comparison', {})
+    def _run_features_stage(self) -> Dict[str, Any]:
+        """
+        Stage 3: Extract and visualize features.
         
-        self.logger.info("MAIN PIPELINE RESULTS:")
-        self.logger.info(f"  F1-Score: {main.get('f1_score', 0):.3f}")
-        self.logger.info(f"  Precision: {main.get('precision', 0):.3f}")
-        self.logger.info(f"  Recall: {main.get('recall', 0):.3f}")
-        self.logger.info(f"  Coordinate Error: {main.get('avg_coordinate_error', 0):.1f} pixels")
-        self.logger.info(f"  Count MAE: {main.get('count_mae', 0):.3f}")
+        Prerequisites:
+        - temp/normalized/ must exist
+        - temp/candidate_windows/ must exist
         
-        self.logger.info("STACKED MODEL RESULTS:")
-        self.logger.info(f"  F1-Score: {stacked.get('f1_score', 0):.3f}")
-        self.logger.info(f"  Precision: {stacked.get('precision', 0):.3f}")
-        self.logger.info(f"  Recall: {stacked.get('recall', 0):.3f}")
-        self.logger.info(f"  Coordinate Error: {stacked.get('avg_coordinate_error', 0):.1f} pixels")
-        self.logger.info(f"  Count MAE: {stacked.get('count_mae', 0):.3f}")
+        Outputs:
+        - output/03_features/ - Feature visualizations (HOG overlays, LBP patterns)
         
-        self.logger.info("IMPROVEMENTS:")
-        self.logger.info(f"  F1-Score: {comp.get('f1_improvement', 0):+.3f}")
-        self.logger.info(f"  Coordinate Error: {comp.get('coord_error_improvement', 0):+.1f} pixels")
+        Note: Features are NOT saved, training uses generator.
+        """
+        # Check prerequisites
+        if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Features', 'normalization'):
+            raise FileNotFoundError(f"ERROR: Features - Normalized data not found. Run --steps normalization first.")
+        if not self._check_checkpoint_exists(self.checkpoint_windows, 'Features', 'windows'):
+            raise FileNotFoundError(f"ERROR: Features - Window data not found. Run --steps windows first.")
+        
+        output_dir = self._create_stage_output_dir('features')
+        
+        # Load checkpoints
+        self.logger.info("Loading checkpoints...")
+        self._load_checkpoints()
+        
+        # Generate feature visualizations
+        self.logger.info("Generating feature visualizations...")
+        windows = self.feature_extractor.load_windows(self.checkpoint_windows)
+        self.feature_extractor.visualize_features(windows, self.data_loader, output_dir)
+        
+        return {
+            'visualization_dir': str(output_dir)
+        }
     
-    def extract_features_and_train(self):
+    def _run_tuning_stage(self) -> Dict[str, Any]:
         """
-        RAM-efficient: Process images in batches, train incrementally.
+        Stage 4: Hyperparameter optimization with Optuna.
         
-        This implements the core two-stage detection approach:
-        - Process training images in memory-friendly batches
-        - Extract combined HOG+LBP features  
-        - Generate balanced positive/negative windows
-        - Train SVM classifier and SVR regressor incrementally
+        Prerequisites:
+        - temp/normalized/ must exist
+        - temp/candidate_windows/ must exist
+        
+        Outputs:
+        - output/04_tuning/svm/ - SVM optimization results
+        - output/04_tuning/svr/ - SVR optimization results
         """
-        # Process training annotations in batches for memory efficiency
+        # Check prerequisites
+        if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Tuning', 'normalization'):
+            raise FileNotFoundError(f"ERROR: Tuning - Normalized data not found. Run --steps normalization first.")
+        if not self._check_checkpoint_exists(self.checkpoint_windows, 'Tuning', 'windows'):
+            raise FileNotFoundError(f"ERROR: Tuning - Window data not found. Run --steps windows first.")
+        
+        output_dir = self._create_stage_output_dir('tuning')
+        
+        # Load checkpoints
+        self.logger.info("Loading checkpoints...")
+        self.data_loader = DataLoader(self.config.data)
+        self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        
+        feature_config = {
+            **self.config.windows,
+            **self.config.training,
+            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4])
+        }
+        self.feature_extractor = FeatureExtractor(feature_config)
+        
+        # Run Optuna optimization with sequential strategy (SVM then SVR)
+        self.logger.info("Running hyperparameter optimization...")
+        from src.optuna import OptunaTuner
+        
+        # Create training function for Optuna
+        def train_and_evaluate(params: dict) -> dict:
+            """Train models with given parameters and return metrics."""
+            # Temporarily suppress verbose logging during trials
+            import logging
+            prev_levels = {}
+            for logger_name in ['src.features.feature_extractor', 'src.models.model_trainer']:
+                logger = logging.getLogger(logger_name)
+                prev_levels[logger_name] = logger.level
+                logger.setLevel(logging.WARNING)
+            
+            try:
+                # Create trial config
+                trial_config = self.config._config.copy()
+                
+                # Update model parameters
+                if 'model' not in trial_config:
+                    trial_config['model'] = {}
+                trial_config['model'].update(params)
+                
+                # Create model trainer with trial config
+                from src.models import ModelTrainer
+                trial_trainer = ModelTrainer(trial_config)
+                
+                # Train models
+                window_batches = self.feature_extractor.generate_training_windows_batch(
+                    self.data_loader.train_annotations,
+                    self.data_loader.load_image
+                )
+                training_metrics = trial_trainer.train_models(window_batches)
+                
+                # Return actual metrics from training
+                return {
+                    'f1_score': training_metrics['svm']['f1_score'],
+                    'avg_coordinate_error': training_metrics['svr']['mean_error']
+                }
+            finally:
+                # Restore logging levels
+                for logger_name, level in prev_levels.items():
+                    logging.getLogger(logger_name).setLevel(level)
+        
+        # Initialize tuner
+        optuna_config = self.config._config.get('optimization', {})
+        tuner = OptunaTuner(optuna_config, self.logger)
+        
+        # Run sequential optimization
+        best_params = tuner.optimize_sequential(train_and_evaluate, str(output_dir))
+        
+        return {
+            'best_params': best_params,
+            'output_dir': str(output_dir)
+        }
+    
+    def _run_training_stage(self) -> Dict[str, Any]:
+        """
+        Stage 5: Train models and collect metrics.
+        
+        Prerequisites:
+        - temp/normalized/ must exist
+        - temp/candidate_windows/ must exist
+        
+        Outputs:
+        - output/05_training/{model_name}/ - Training metrics and curves
+        - output/models/ - Saved models
+        """
+        # Check prerequisites
+        if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Training', 'normalization'):
+            raise FileNotFoundError(f"ERROR: Training - Normalized data not found. Run --steps normalization first.")
+        if not self._check_checkpoint_exists(self.checkpoint_windows, 'Training', 'windows'):
+            raise FileNotFoundError(f"ERROR: Training - Window data not found. Run --steps windows first.")
+        
+        output_dir = self._create_stage_output_dir('training')
+        
+        # Load checkpoints
+        self.logger.info("Loading checkpoints...")
+        self.data_loader = DataLoader(self.config.data)
+        self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        
+        feature_config = {
+            **self.config.windows,
+            **self.config.training,
+            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4])
+        }
+        self.feature_extractor = FeatureExtractor(feature_config)
+        
+        # Load tuning results if available
+        tuning_dir = self.output_dirs.get('tuning')
+        # Initialize model trainer
+        training_config = self.config._config.copy()
+        self.model_trainer = ModelTrainer(training_config)
+        
+        # Load optimized hyperparameters if available
+        best_params = self.model_trainer.load_tuning_results(tuning_dir) if tuning_dir and tuning_dir.exists() else {}
+        
+        if best_params:
+            if 'model' not in training_config:
+                training_config['model'] = {}
+            training_config['model'].update(best_params)
+            # Reinitialize trainer with updated config
+            self.model_trainer = ModelTrainer(training_config)
+        
+        # Train models with metrics collection (implemented in step 6)
+        self.logger.info("Training models...")
         window_batches = self.feature_extractor.generate_training_windows_batch(
             self.data_loader.train_annotations,
             self.data_loader.load_image
         )
         
-        # Train models on batches
-        self.model_trainer.train_models(window_batches)
+        training_metrics = self.model_trainer.train_models(window_batches)
         
-        self.logger.info(f"Feature extraction and training completed")
-    
-    def train_stacked_model(self):
-        """Train stacked model using base model predictions."""
-        try:
-            # Generate training windows again (or cache from training)
-            window_batches = self.feature_extractor.generate_training_windows_batch(
-                self.data_loader.train_annotations,
-                self.data_loader.load_image
-            )
-            
-            # Collect all windows
-            all_windows = []
-            for batch in window_batches:
-                all_windows.extend(batch)
-            
-            # Initialize stacked model
-            self.stacked_model = StackedNurdleDetector(
-                self.model_trainer,
-                self.config._config,
-                self.logger
-            )
-            
-            # Train meta-learner
-            self.stacked_model.train_stacking_model(all_windows)
-            
-            self.logger.info("Stacked model training completed")
-            
-        except Exception as e:
-            self.logger.error(f"Stacked model training failed: {e}")
-            self.stacked_model = None
-    
-    def evaluate_main_model(self) -> dict:
-        """Evaluate main pipeline only."""
-        def predict_func(image_path):
-            return self.predict_image(image_path, use_stacked=False)
+        # Save models
+        self.logger.info("Saving models...")
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.model_trainer.save_models(str(self.models_dir))
         
-        metrics = self.evaluator.evaluate_models(
-            test_annotations=self.data_loader.test_annotations,
-            predict_image_func=predict_func
-        )
-        
-        return {'main_pipeline': metrics}
-    
-    def evaluate_both_models(self) -> dict:
-        """Evaluate both main and stacked models for comparison."""
-        # Evaluate main pipeline
-        def predict_main(image_path):
-            return self.predict_image(image_path, use_stacked=False)
-        
-        main_metrics = self.evaluator.evaluate_models(
-            test_annotations=self.data_loader.test_annotations,
-            predict_image_func=predict_main
-        )
-        
-        # Evaluate stacked model
-        def predict_stacked(image_path):
-            return self.predict_image(image_path, use_stacked=True)
-        
-        stacked_metrics = self.evaluator.evaluate_models(
-            test_annotations=self.data_loader.test_annotations,
-            predict_image_func=predict_stacked
-        )
-        
-        # Calculate improvements
-        comparison = {
-            'f1_improvement': stacked_metrics['f1_score'] - main_metrics['f1_score'],
-            'coord_error_improvement': main_metrics['avg_coordinate_error'] - stacked_metrics['avg_coordinate_error'],
-            'precision_improvement': stacked_metrics['precision'] - main_metrics['precision'],
-            'recall_improvement': stacked_metrics['recall'] - main_metrics['recall'],
-        }
+        # Save training metrics
+        self.logger.info("Saving training metrics...")
+        self.model_trainer.save_training_metrics(training_metrics, str(output_dir))
         
         return {
-            'main_pipeline': main_metrics,
-            'stacked_model': stacked_metrics,
-            'comparison': comparison
+            'training_metrics': training_metrics,
+            'models_dir': str(self.models_dir),
+            'output_dir': str(output_dir)
         }
     
-    def predict_image(self, image_path: str, use_stacked: bool = False):
+    def _run_evaluation_stage(self) -> Dict[str, Any]:
         """
-        Predict nurdle count and coordinates using two-stage detection.
+        Stage 6: Comprehensive evaluation of trained models.
         
-        Args:
-            image_path: Path to image file
-            use_stacked: If True, use stacked model; else use main pipeline
-            
-        Returns:
-            Tuple of (nurdle_count, coordinates_list)
+        Prerequisites:
+        - temp/normalized/ must exist
+        - output/models/ must have trained models
+        
+        Outputs:
+        - output/06_evaluation/ - Evaluation metrics, visualizations, and report
         """
-        # Load original image to get dimensions
-        import cv2
-        original_image = cv2.imread(image_path)
-        if original_image is None:
-            raise ValueError(f"Could not load image: {image_path}")
-        original_h, original_w = original_image.shape[:2]
+        # Check prerequisites
+        if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Evaluation', 'normalization'):
+            raise FileNotFoundError(f"ERROR: Evaluation - Normalized data not found. Run --steps normalization first.")
         
-        # Load and normalize image for processing
-        normalized_image = self.data_loader.load_image(image_path)
-        normalized_h, normalized_w = normalized_image.shape[:2]
+        if not self.models_dir.exists() or not any(self.models_dir.glob('*.pkl')):
+            raise FileNotFoundError(f"ERROR: Evaluation - No trained models found in {self.models_dir}. Run --steps training first.")
         
-        # Calculate scale factors to convert back to original coordinates
-        scale_x = original_w / normalized_w
-        scale_y = original_h / normalized_h
+        output_dir = self._create_stage_output_dir('evaluation')
         
-        # Extract features from all sliding windows
-        detections = []
+        # Load test data
+        self.logger.info("Loading test data...")
+        self._load_checkpoints()
+        self.model_trainer = ModelTrainer(self.config._config)
         
-        for features, x, y in self.feature_extractor.extract_sliding_window_features(normalized_image):
-            # Calculate window center in normalized coordinates
-            window_center_x = x + self.feature_extractor.window_size[0] / 2.0
-            window_center_y = y + self.feature_extractor.window_size[1] / 2.0
-            
-            # Get prediction based on model type
-            if use_stacked and self.stacked_model and self.stacked_model.is_trained:
-                # Use stacked model
-                is_nurdle, confidence, offset_x, offset_y = \
-                    self.stacked_model.predict_with_confidence(features)
-            else:
-                # Use main pipeline (SVM + SVR)
-                is_nurdle, svm_conf, offset_x, offset_y, svr_conf = \
-                    self.model_trainer.predict_with_confidence(features)
-                confidence = svm_conf  # Use SVM confidence for filtering
-            
-            if is_nurdle:
-                # Refine coordinates using SVR offset prediction
-                refined_x = window_center_x + offset_x
-                refined_y = window_center_y + offset_y
-                
-                # Scale back to original image coordinates
-                original_x = refined_x * scale_x
-                original_y = refined_y * scale_y
-                
-                detections.append((original_x, original_y, confidence))
+        # Load trained models
+        self.logger.info(f"Loading models from {self.models_dir}...")
+        self.model_trainer.load_models(str(self.models_dir))
         
-        # Apply Non-Maximum Suppression to remove duplicates
-        from src.evaluation import NonMaximumSuppression
-        nms_distance = int(self.feature_extractor.window_size[0] * scale_x)
-        nms = NonMaximumSuppression(default_min_distance=nms_distance)
-        filtered_detections = nms.apply_nms(detections)
+        # Initialize evaluator, NMS, and prediction engine
+        from src.evaluation.evaluator import ModelEvaluator
+        from src.evaluation.nms import NonMaximumSuppression
+        from src.models import PredictionEngine
         
-        # Extract final coordinates and count
-        coordinates = [(d[0], d[1]) for d in filtered_detections]
-        nurdle_count = len(coordinates)
+        self.evaluator = ModelEvaluator(self.logger)
+        nms_config = self.config._config.get('evaluation', {}).get('nms', {})
+        nms_distance = nms_config.get('distance_threshold', 20.0)
+        self.nms = NonMaximumSuppression(default_min_distance=nms_distance)
         
-        return nurdle_count, coordinates
-    
-    def _predict_for_optuna(self, image_path: str, feature_extractor, model_trainer):
-        """
-        Helper method for Optuna optimization - predicts using trial models.
+        # Create prediction engine
+        prediction_engine = PredictionEngine(
+            self.feature_extractor,
+            self.model_trainer,
+            self.nms
+        )
         
-        Args:
-            image_path: Path to image
-            feature_extractor: Trial feature extractor
-            model_trainer: Trial model trainer
-            
-        Returns:
-            Tuple of (count, coordinates)
-        """
-        # Load and normalize image
-        image = self.data_loader.load_image(image_path)
-        
-        # Extract features and predict
-        detections = []
-        threshold = self.config.get('confidence').get('svm_threshold', 0.5)
-        
-        for features, x, y in feature_extractor.extract_sliding_window_features(image):
-            is_nurdle, svm_conf, offset_x, offset_y, _ = model_trainer.predict_with_confidence(features)
-            
-            if is_nurdle and svm_conf > threshold:
-                center_x = x + feature_extractor.window_size[0] / 2.0
-                center_y = y + feature_extractor.window_size[1] / 2.0
-                refined_x = center_x + offset_x
-                refined_y = center_y + offset_y
-                detections.append((refined_x, refined_y, svm_conf))
-        
-        # Apply NMS
-        from src.evaluation import NonMaximumSuppression
-        nms = NonMaximumSuppression(default_min_distance=feature_extractor.window_size[0])
-        filtered = nms.apply_nms(detections)
-        
-        coordinates = [(d[0], d[1]) for d in filtered]
-        return len(coordinates), coordinates
-    
-    def run_optimization(self, input_dir: str, output_dir: str, 
-                        n_trials: int = 20, metric: str = 'f1_score'):
-        """
-        Run hyperparameter optimization using Optuna (Phase 8).
-        
-        Args:
-            input_dir: Input directory containing images and annotations
-            output_dir: Output directory for results and optimized models
-            n_trials: Number of optimization trials
-            metric: Metric to optimize ('f1_score', 'precision', 'recall', 'count_accuracy')
-            
-        Returns:
-            Dictionary of best parameters found
-        """
-        self.logger.info("=" * 60)
-        self.logger.info("STARTING HYPERPARAMETER OPTIMIZATION (PHASE 8)")
-        self.logger.info("=" * 60)
-        
-        try:
-            # Import Optuna components
-            from src.optuna import OptunaTuner
-            
-            # Setup directories
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
-            
-            # Load data if not already loaded
-            if not hasattr(self, 'data_loader') or not self.data_loader:
-                config_dict = self.config.load() if self.config._config is None else self.config._config
-                self.data_loader = DataLoader(config_dict)
-                self.data_loader.load_annotations(input_dir)
-            
-            # Configure Optuna optimization
-            optuna_config = {
-                'n_trials': n_trials,
-                'metric': metric,
-                'direction': 'maximize',
-                'save_plots': True
-            }
-            
-            # Initialize tuner
-            tuner = OptunaTuner(optuna_config, self.logger)
-            
-            # Create training function for optimization
-            def train_func(params: Dict[str, Any]) -> Dict[str, float]:
-                """Train and evaluate with given parameters."""
-                # Update config with trial parameters
-                trial_config = self.config._config.copy() if self.config._config else {}
-                trial_config['model']['svm'].update({
-                    'C': params.get('svm_c', 1.0),
-                    'kernel': params.get('svm_kernel', 'linear'),
-                    'gamma': params.get('svm_gamma', 'scale')
-                })
-                trial_config['model']['svr'].update({
-                    'C': params.get('svr_c', 1.0),
-                    'kernel': params.get('svr_kernel', 'linear'),
-                    'gamma': params.get('svr_gamma', 'scale')
-                })
-                
-                # Train models with trial parameters
-                feature_extractor = FeatureExtractor(trial_config['features'])
-                model_trainer = ModelTrainer(trial_config['model'])
-                
-                window_batches = feature_extractor.generate_training_windows_batch(
-                    self.data_loader.train_annotations,
-                    self.data_loader.load_image
-                )
-                model_trainer.train_models(window_batches)
-                
-                # Evaluate on test set
-                evaluator = ModelEvaluator(self.logger)
-                metrics = evaluator.evaluate_models(
-                    self.data_loader.test_annotations,
-                    lambda img_path: self._predict_for_optuna(img_path, feature_extractor, model_trainer)
-                )
-                return metrics
-            
-            # Run sequential optimization
-            self.logger.info(f"Optimizing {metric} over {n_trials} trials (sequential strategy)...")
-            best_params = tuner.optimize_sequential(
-                train_func,
-                str(output_path)
+        # Create prediction function
+        def predict_image_with_nms(image_path: str):
+            """Predict nurdles for an image using prediction engine."""
+            count, detections = prediction_engine.predict_image_from_path(
+                image_path,
+                self.data_loader,
+                nms_distance
             )
-            
-            self.logger.info("=" * 60)
-            self.logger.info("OPTIMIZATION COMPLETED SUCCESSFULLY")
-            self.logger.info("=" * 60)
-            self.logger.info(f"Best {metric}: {tuner.best_value:.4f}")
-            self.logger.info("Best parameters:")
-            for key, value in best_params.items():
-                self.logger.info(f"  {key}: {value}")
-            
-            # Optionally retrain with best parameters and evaluate
-            optimization_config = self.config.get('optimization')
-            if optimization_config.get('retrain_with_best', True):
-                self.logger.info("\nRetraining pipeline with optimized parameters...")
-                final_metrics = train_func(best_params)
-                self._log_final_results(final_metrics)
-                
-                return best_params, final_metrics
-            
-            return best_params, None
-            
-        except ImportError as e:
-            self.logger.error(f"Optuna not available: {e}")
-            self.logger.error("Install optuna and plotly: pip install optuna plotly")
-            raise
-            
-        except Exception as e:
-            self.logger.error(f"Optimization failed: {e}")
-            raise
+            return count, detections
+        
+        # Run evaluation
+        self.logger.info(f"Evaluating on {len(self.data_loader.test_annotations)} test images...")
+        metrics = self.evaluator.evaluate_models(
+            test_annotations=self.data_loader.test_annotations,
+            predict_image_func=predict_image_with_nms
+        )
+        
+        # Save evaluation results
+        self.logger.info("Saving evaluation results...")
+        self.evaluator.save_evaluation_results(metrics, str(output_dir))
+        
+        # Generate evaluation report
+        self.logger.info("Generating evaluation report...")
+        report_path = self.evaluator.generate_evaluation_report(metrics, str(output_dir))
+        
+        # Generate visualizations
+        self.logger.info("Generating evaluation visualizations...")
+        viz_dir = output_dir / 'visualizations'
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.evaluator.generate_evaluation_visualizations(
+            test_annotations=self.data_loader.test_annotations,
+            predict_image_func=predict_image_with_nms,
+            data_loader=self.data_loader,
+            metrics=metrics,
+            output_dir=str(viz_dir)
+        )
+        
+        return {
+            'metrics': metrics,
+            'report_path': report_path,
+            'output_dir': str(output_dir),
+            'visualizations_dir': str(viz_dir)
+        }
     
-    def _log_final_results(self, metrics: dict):
-        """Log final pipeline results."""
-        self.logger.info("FINAL RESULTS:")
-        self.logger.info(f"  Count Accuracy: {metrics.get('count_accuracy', 0):.3f}")
-        self.logger.info(f"  Count MAE: {metrics.get('count_mae', 0):.3f}")
-        self.logger.info(f"  Coordinate Error: {metrics.get('avg_coordinate_error', 0):.1f} pixels")
-        self.logger.info(f"  Precision: {metrics.get('precision', 0):.3f}")
-        self.logger.info(f"  Recall: {metrics.get('recall', 0):.3f}")
-        self.logger.info(f"  F1-Score: {metrics.get('f1_score', 0):.3f}")
+    def clean_temp(self):
+        """Clean temporary checkpoint files."""
+        self.logger.info("Cleaning temporary files...")
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir)
+            self.logger.info(f"Removed {self.temp_dir}")
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logging():
@@ -581,7 +621,7 @@ def setup_logging():
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Nurdle Detection Pipeline',
+        description='Modular Nurdle Detection Pipeline',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -593,43 +633,22 @@ def parse_arguments():
     )
     
     parser.add_argument(
-        '--input',
+        '--steps',
         type=str,
-        help='Input directory (overrides config)'
+        default=None,
+        help='Comma-separated list of stages to run (default: all stages in order). Options: normalization,windows,features,tuning,training,evaluation'
     )
     
     parser.add_argument(
-        '--output', 
-        type=str,
-        help='Output directory (overrides config)'
+        '--clean-temp',
+        action='store_true',
+        help='Clean temporary checkpoint files'
     )
     
     parser.add_argument(
         '--verbose',
         action='store_true',
         help='Enable verbose logging'
-    )
-    
-    # Phase 8: Optuna optimization arguments
-    parser.add_argument(
-        '--optimize',
-        action='store_true',
-        help='Run hyperparameter optimization using Optuna'
-    )
-    
-    parser.add_argument(
-        '--n-trials',
-        type=int,
-        default=20,
-        help='Number of optimization trials for Optuna'
-    )
-    
-    parser.add_argument(
-        '--metric',
-        type=str,
-        default='f1_score',
-        choices=['f1_score', 'precision', 'recall', 'count_accuracy'],
-        help='Metric to optimize'
     )
     
     return parser.parse_args()
@@ -650,62 +669,48 @@ def main():
         # Initialize pipeline
         pipeline = NurdlePipeline(args.config)
         
-        # Get directories
-        input_dir = args.input or pipeline.config.data.get('input_dir', 'input')
-        output_dir = args.output or pipeline.config.data.get('output_dir', 'output')
+        # Clean temp if requested
+        if args.clean_temp:
+            pipeline.clean_temp()
+            print("Temporary files cleaned.")
+            return 0
         
-        # Check if we should run optimization (Phase 8)
-        if args.optimize:
-            print("\n" + "=" * 60)
-            print("RUNNING HYPERPARAMETER OPTIMIZATION (PHASE 8)")
-            print("=" * 60)
-            
-            # Run optimization
-            best_params, final_metrics = pipeline.run_optimization(
-                input_dir, output_dir, args.n_trials, args.metric
-            )
-            
-            # Print optimization results
-            print("\n" + "=" * 60)
-            print("OPTIMIZATION COMPLETED")
-            print("=" * 60)
-            # Best metric value is already logged by the optimization method
-            print("Best Parameters:")
-            for key, value in best_params.items():
-                print(f"  {key}: {value}")
-            
-            if final_metrics:
-                print("\nFinal Model Performance:")
-                print(f"  Count Accuracy: {final_metrics['count_accuracy']:.3f}")
-                print(f"  Count MAE: {final_metrics['count_mae']:.3f}")
-                print(f"  Avg Coordinate Error: {final_metrics['avg_coordinate_error']:.1f} pixels")
-                print(f"  Precision: {final_metrics['precision']:.3f}")
-                print(f"  Recall: {final_metrics['recall']:.3f}")
-                print(f"  F1-Score: {final_metrics['f1_score']:.3f}")
-                
-            print("=" * 60)
-            
+        # Parse and validate steps
+        if not args.steps:
+            # Default to all stages in order
+            steps = NurdlePipeline.AVAILABLE_STAGES.copy()
+            print(f"No steps specified, running all stages: {', '.join(steps)}")
         else:
-            # Run standard pipeline
-            metrics = pipeline.run_full_pipeline(input_dir, output_dir)
-            
-            # Print final results
-            print("\n" + "=" * 50)
-            print("FINAL RESULTS:")
-            print(f"  Count Accuracy: {metrics['count_accuracy']:.3f}")
-            print(f"  Count MAE: {metrics['count_mae']:.3f}")  
-            print(f"  Avg Coordinate Error: {metrics['avg_coordinate_error']:.1f} pixels")
-            print(f"  Test Images: {metrics['n_test_images']}")
-            print("=" * 50)
+            steps = [s.strip() for s in args.steps.split(',')]
+        
+        # Validate steps
+        invalid_steps = [s for s in steps if s not in NurdlePipeline.AVAILABLE_STAGES]
+        if invalid_steps:
+            print(f"ERROR: Invalid steps: {invalid_steps}")
+            print(f"Available steps: {NurdlePipeline.AVAILABLE_STAGES}")
+            return 1
+        
+        # Run pipeline
+        results = pipeline.run(steps)
+        
+        print("\n" + "=" * 80)
+        print("PIPELINE EXECUTION SUMMARY")
+        print("=" * 80)
+        for stage, result in results.items():
+            print(f"\n{stage.upper()}:")
+            for key, value in result.items():
+                print(f"  {key}: {value}")
+        print("=" * 80)
         
         return 0
         
     except KeyboardInterrupt:
-        print("Pipeline interrupted by user")
+        print("\nPipeline interrupted by user")
         return 1
         
     except Exception as e:
-        print(f"Pipeline failed: {e}")
+        print(f"\nPipeline failed: {e}")
+        logging.exception("Full error trace:")
         return 1
 
 

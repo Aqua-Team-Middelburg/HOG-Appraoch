@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Iterator
 from dataclasses import dataclass
 import logging
+import random
 
 
 @dataclass
@@ -60,6 +61,7 @@ class DataLoader:
         # Configuration parameters
         self.train_test_ratio = config.get('train_test_ratio', 0.8)
         self.target_resolution = config.get('target_resolution', 1080)
+        self.target_nurdle_radius = config.get('target_nurdle_radius', None)
         self.batch_size = config.get('batch_size', 15)
         
         # Data storage
@@ -131,6 +133,8 @@ class DataLoader:
         
         self.logger.info(f"Loaded {len(self.annotations)} annotations")
     
+
+    
     def normalize_image(self, image: np.ndarray) -> np.ndarray:
         """
         Normalize image to target resolution while maintaining aspect ratio.
@@ -186,46 +190,7 @@ class DataLoader:
             batch = annotations[i:i + self.batch_size]
             yield batch
     
-    def get_normalization_scale(self, image: np.ndarray) -> tuple:
-        """
-        Get the scale factors that would be applied when normalizing an image.
-        
-        Args:
-            image: Input image as numpy array
-            
-        Returns:
-            Tuple of (scale_x, scale_y) - will be 1.0 if no scaling needed
-        """
-        h, w = image.shape[:2]
-        scale = min(self.target_resolution / w, self.target_resolution / h)
-        
-        if scale < 1.0:
-            return (scale, scale)
-        return (1.0, 1.0)
-    
-    def transform_coordinates(self, annotation: ImageAnnotation, original_image: np.ndarray) -> ImageAnnotation:
-        """
-        Transform annotation coordinates to normalized image space.
-        
-        Args:
-            annotation: Original annotation with coordinates in original image space
-            original_image: The original image (to calculate scale factors)
-            
-        Returns:
-            New ImageAnnotation with transformed coordinates
-        """
-        scale_x, scale_y = self.get_normalization_scale(original_image)
-        
-        transformed_nurdles = [
-            NurdleAnnotation(x=n.x * scale_x, y=n.y * scale_y) 
-            for n in annotation.nurdles
-        ]
-        
-        return ImageAnnotation(
-            image_path=annotation.image_path,
-            nurdles=transformed_nurdles,
-            image_id=annotation.image_id
-        )
+
     
     def load_image(self, image_path: str) -> np.ndarray:
         """
@@ -257,3 +222,262 @@ class DataLoader:
     def num_test(self) -> int:
         """Get number of test annotations."""
         return len(self.test_annotations)
+    
+    def save_normalized_data(self, checkpoint_dir: Path) -> None:
+        """
+        Save normalized images and metadata to checkpoint directory.
+        
+        Saves:
+        - Normalized PNG images
+        - JSON metadata with dimensions, scale factors, and train/test splits
+        
+        Args:
+            checkpoint_dir: Directory to save checkpoint files
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.logger.info(f"Saving normalized data checkpoint to {checkpoint_dir}")
+        
+
+        
+        # Create subdirectories
+        images_dir = checkpoint_dir / 'images'
+        images_dir.mkdir(exist_ok=True)
+        
+        # Prepare metadata
+        metadata = {
+            'target_resolution': self.target_resolution,
+            'train_test_ratio': self.train_test_ratio,
+            'total_images': len(self.annotations),
+            'train_images': len(self.train_annotations),
+            'test_images': len(self.test_annotations),
+            'train_ids': [ann.image_id for ann in self.train_annotations],
+            'test_ids': [ann.image_id for ann in self.test_annotations],
+            'image_metadata': {}
+        }
+        
+        # Save all images and collect metadata
+        for annotation in self.annotations:
+            try:
+                # Load original image to get scale factors
+                original_image = cv2.imread(annotation.image_path)
+                if original_image is None:
+                    self.logger.warning(f"Could not load {annotation.image_path}")
+                    continue
+                
+                orig_h, orig_w = original_image.shape[:2]
+                
+                # Use resolution-based normalization
+                normalized_image = self.normalize_image(original_image)
+                
+                norm_h, norm_w = normalized_image.shape[:2]
+                
+                # Calculate scale factors
+                scale_x = norm_w / orig_w
+                scale_y = norm_h / orig_h
+                
+                # Store original coordinates
+                original_nurdles = [
+                    {'x': n.x, 'y': n.y}
+                    for n in annotation.nurdles
+                ]
+                
+                # Transform nurdle coordinates to normalized space
+                transformed_nurdles = [
+                    {'x': n.x * scale_x, 'y': n.y * scale_y}
+                    for n in annotation.nurdles
+                ]
+                
+                # Save normalized image
+                image_filename = f"{annotation.image_id}.png"
+                image_path = images_dir / image_filename
+                cv2.imwrite(str(image_path), normalized_image)
+                
+                # Store metadata
+                metadata['image_metadata'][annotation.image_id] = {
+                    'original_path': annotation.image_path,
+                    'normalized_path': str(image_path),
+                    'original_dimensions': {'width': orig_w, 'height': orig_h},
+                    'normalized_dimensions': {'width': norm_w, 'height': norm_h},
+                    'scale_factors': {'x': scale_x, 'y': scale_y},
+                    'original_nurdles': original_nurdles,
+                    'nurdles': transformed_nurdles,
+                    'nurdle_count': len(transformed_nurdles)
+                }
+                
+            except Exception as e:
+                self.logger.error(f"Error saving {annotation.image_path}: {e}")
+        
+        # Save metadata JSON
+        metadata_path = checkpoint_dir / 'metadata.json'
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        self.logger.info(f"Saved {len(metadata['image_metadata'])} normalized images")
+    
+    def load_normalized_data(self, checkpoint_dir: Path) -> None:
+        """
+        Load normalized images and metadata from checkpoint directory.
+        
+        Args:
+            checkpoint_dir: Directory containing checkpoint files
+            
+        Raises:
+            FileNotFoundError: If checkpoint directory or metadata file not found
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        if not checkpoint_dir.exists():
+            raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+        
+        metadata_path = checkpoint_dir / 'metadata.json'
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        
+        self.logger.info(f"Loading normalized data checkpoint from {checkpoint_dir}")
+        
+        # Load metadata
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        # Restore configuration
+        self.target_resolution = metadata['target_resolution']
+        self.train_test_ratio = metadata['train_test_ratio']
+        
+        # Reconstruct annotations
+        self.annotations = []
+        self.train_annotations = []
+        self.test_annotations = []
+        
+        for image_id, img_meta in metadata['image_metadata'].items():
+            # Create nurdle annotations with normalized coordinates
+            nurdles = [
+                NurdleAnnotation(x=n['x'], y=n['y'])
+                for n in img_meta['nurdles']
+            ]
+            
+            # Create annotation pointing to normalized image
+            annotation = ImageAnnotation(
+                image_path=img_meta['normalized_path'],
+                nurdles=nurdles,
+                image_id=image_id
+            )
+            
+            self.annotations.append(annotation)
+            
+            # Sort into train/test
+            if image_id in metadata['train_ids']:
+                self.train_annotations.append(annotation)
+            elif image_id in metadata['test_ids']:
+                self.test_annotations.append(annotation)
+        
+        self.logger.info(f"Loaded {len(self.annotations)} annotations: "
+                        f"{len(self.train_annotations)} train, {len(self.test_annotations)} test")
+    
+    def visualize_normalization_samples(self, checkpoint_dir: Path, output_dir: Path, num_samples: int = 3) -> None:
+        """
+        Generate visualization of normalized test images with annotations.
+        
+        IMPORTANT: Uses TEST SET samples only for visualization - NO data leakage!
+        Test images are never used in training, only for demonstration purposes.
+        
+        Args:
+            checkpoint_dir: Directory containing normalized data
+            output_dir: Directory to save visualizations
+            num_samples: Maximum number of samples (limited by test set size, max 3)
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Use TEST set samples only (no data leakage)
+        if len(self.test_annotations) == 0:
+            self.logger.warning("No test samples available for normalization visualization")
+            return
+        
+        # Limit to min(num_samples, test set size, 3)
+        n_samples = min(num_samples, len(self.test_annotations), 3)
+        sample_annotations = self.test_annotations[:n_samples]
+        
+        self.logger.info(f"Generating normalization visualizations using {n_samples} TEST set samples (no data leakage)")
+        
+        # Load metadata to get original paths
+        metadata_path = checkpoint_dir / 'metadata.json'
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        # Create one file per test image
+        for annotation in sample_annotations:
+            try:
+                # Get original path from metadata
+                img_meta = metadata['image_metadata'].get(annotation.image_id)
+                if not img_meta:
+                    self.logger.warning(f"No metadata found for {annotation.image_id}")
+                    continue
+                
+                original_path = Path(img_meta['original_path'])
+                if not original_path.exists():
+                    self.logger.warning(f"Original image not found: {original_path}")
+                    continue
+                
+                # Load original image
+                original_img = cv2.imread(str(original_path))
+                if original_img is None:
+                    self.logger.warning(f"Failed to load original image: {original_path}")
+                    continue
+                original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+                
+                # Load normalized image (try both .png and .jpg extensions)
+                normalized_path = checkpoint_dir / 'images' / f"{annotation.image_id}.png"
+                if not normalized_path.exists():
+                    normalized_path = checkpoint_dir / 'images' / f"{annotation.image_id}.jpg"
+                
+                if not normalized_path.exists():
+                    self.logger.warning(f"Normalized image not found: {normalized_path}")
+                    continue
+                
+                normalized_img = cv2.imread(str(normalized_path))
+                if normalized_img is None:
+                    self.logger.warning(f"Failed to load normalized image: {normalized_path}")
+                    continue
+                normalized_img = cv2.cvtColor(normalized_img, cv2.COLOR_BGR2RGB)
+                
+                # Create figure with original and normalized side-by-side
+                fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+                fig.suptitle(f'Image Normalization: {annotation.image_id} (TEST sample - Visualization Only)', 
+                            fontsize=14, fontweight='bold')
+                
+                # Plot original with original coordinates
+                axes[0].imshow(original_img)
+                for nurdle_data in img_meta['original_nurdles']:
+                    circle = Circle((nurdle_data['x'], nurdle_data['y']), radius=15, 
+                                   color='lime', fill=False, linewidth=2)
+                    axes[0].add_patch(circle)
+                axes[0].set_title(f'Original ({img_meta["original_dimensions"]["width"]}x{img_meta["original_dimensions"]["height"]})\n{len(img_meta["original_nurdles"])} nurdles', 
+                                 fontsize=12, fontweight='bold')
+                axes[0].axis('off')
+                
+                # Plot normalized with normalized coordinates
+                axes[1].imshow(normalized_img)
+                for nurdle_data in img_meta['nurdles']:
+                    circle = Circle((nurdle_data['x'], nurdle_data['y']), radius=15, 
+                                   color='lime', fill=False, linewidth=2)
+                    axes[1].add_patch(circle)
+                axes[1].set_title(f'Normalized ({img_meta["normalized_dimensions"]["width"]}x{img_meta["normalized_dimensions"]["height"]})\n{len(img_meta["nurdles"])} nurdles', 
+                                 fontsize=12, fontweight='bold')
+                axes[1].axis('off')
+                
+                plt.tight_layout()
+                output_file = output_path / f'{annotation.image_id}_normalization.png'
+                plt.savefig(output_file, dpi=150, bbox_inches='tight')
+                plt.close()
+                
+                self.logger.info(f"Saved normalization visualization: {output_file}")
+                
+            except Exception as e:
+                self.logger.error(f"Error visualizing {annotation.image_id}: {e}")
+        
+        self.logger.info(f"Generated {n_samples} normalization visualization files")

@@ -24,13 +24,15 @@ class EvaluationMetrics:
     
     def calculate_count_metrics(self, 
                               ground_truth: List[int], 
-                              predictions: List[int]) -> Dict[str, float]:
+                              predictions: List[int],
+                              tolerance_percent: float = 10.0) -> Dict[str, float]:
         """
         Calculate count prediction metrics.
         
         Args:
             ground_truth: List of actual nurdle counts
             predictions: List of predicted nurdle counts
+            tolerance_percent: Percentage tolerance for count accuracy (default 10%)
             
         Returns:
             Dictionary of count-related metrics
@@ -43,7 +45,15 @@ class EvaluationMetrics:
                 'count_bias': 0.0
             }
         
-        accuracy = accuracy_score(ground_truth, predictions)
+        # Calculate accuracy within tolerance (more realistic for count prediction)
+        # A prediction is accurate if within tolerance_percent of ground truth
+        accurate_predictions = 0
+        for gt, pred in zip(ground_truth, predictions):
+            tolerance = max(1, int(gt * tolerance_percent / 100))  # At least 1 nurdle tolerance
+            if abs(pred - gt) <= tolerance:
+                accurate_predictions += 1
+        
+        accuracy = accurate_predictions / len(ground_truth)
         mae = mean_absolute_error(ground_truth, predictions)
         rmse = np.sqrt(mean_squared_error(ground_truth, predictions))
         

@@ -96,62 +96,7 @@ class ModelEvaluator:
         
         return metrics
     
-    def evaluate_single_image(self,
-                            image_path: str,
-                            ground_truth_coords: List[Tuple[float, float]],
-                            predict_image_func: Callable[[str], Tuple[int, List[Tuple[float, float]]]],
-                            match_threshold: float = 25.0) -> Dict[str, Any]:
-        """
-        Evaluate model performance on a single image.
-        
-        Args:
-            image_path: Path to image file
-            ground_truth_coords: List of (x, y) ground truth coordinates
-            predict_image_func: Function that takes image_path and returns (count, coordinates)
-            match_threshold: Maximum distance for matching coordinates (pixels)
-            
-        Returns:
-            Dictionary containing detailed evaluation results for this image
-        """
-        try:
-            predicted_count, predicted_coords = predict_image_func(image_path)
-            actual_count = len(ground_truth_coords)
-            
-            # Match coordinates and calculate errors
-            coord_errors, tp, fp, fn = self.coordinate_matcher.match_coordinates(
-                predicted_coords, ground_truth_coords, match_threshold
-            )
-            
-            # Calculate basic metrics for this image
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            
-            results = {
-                'image_path': image_path,
-                'predicted_count': predicted_count,
-                'actual_count': actual_count,
-                'count_error': abs(predicted_count - actual_count),
-                'coordinate_errors': coord_errors,
-                'avg_coordinate_error': np.mean(coord_errors) if coord_errors else 0.0,
-                'true_positives': tp,
-                'false_positives': fp,
-                'false_negatives': fn,
-                'precision': precision,
-                'recall': recall,
-                'f1_score': f1_score,
-                'predicted_coords': predicted_coords,
-                'ground_truth_coords': ground_truth_coords
-            }
-            
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Error evaluating single image {image_path}: {e}")
-            return {
-                'image_path': image_path,
-                'error': str(e)
-            }
+
     
     def save_evaluation_results(self, 
                               metrics: Dict[str, float], 
@@ -188,43 +133,7 @@ class ModelEvaluator:
         
         self.logger.info(f"Saved evaluation results to {results_path}")
     
-    def save_detailed_results(self,
-                            detailed_results: List[Dict[str, Any]],
-                            output_dir: str,
-                            filename: str = "detailed_evaluation.json") -> None:
-        """
-        Save detailed per-image evaluation results.
-        
-        Args:
-            detailed_results: List of per-image evaluation dictionaries
-            output_dir: Output directory path
-            filename: Output filename (default: "detailed_evaluation.json")
-        """
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        results_path = output_path / filename
-        
-        # Convert numpy types for JSON serialization
-        serializable_results = []
-        for result in detailed_results:
-            serializable_result = {}
-            for key, value in result.items():
-                if isinstance(value, np.ndarray):
-                    serializable_result[key] = value.tolist()
-                elif isinstance(value, (np.integer, np.floating)):
-                    serializable_result[key] = float(value)
-                elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], tuple):
-                    # Handle coordinate tuples
-                    serializable_result[key] = [list(coord) for coord in value]
-                else:
-                    serializable_result[key] = value
-            serializable_results.append(serializable_result)
-        
-        with open(results_path, 'w') as f:
-            json.dump(serializable_results, f, indent=2)
-        
-        self.logger.info(f"Saved detailed evaluation results to {results_path}")
+
     
     def generate_evaluation_report(self, 
                                  metrics: Dict[str, float],
@@ -275,102 +184,265 @@ class ModelEvaluator:
         self.logger.info(f"Generated evaluation report: {report_path}")
         return str(report_path)
     
-    def save_comparison_results(self,
-                               main_metrics: Dict[str, float],
-                               stacked_metrics: Dict[str, float],
-                               comparison: Dict[str, float],
-                               output_dir: str) -> None:
-        """
-        Save side-by-side comparison results.
-        
-        Args:
-            main_metrics: Metrics from main pipeline
-            stacked_metrics: Metrics from stacked model
-            comparison: Improvement metrics
-            output_dir: Output directory
-        """
-        output_path = Path(output_dir)
-        evaluations_dir = output_path / "evaluations"
-        evaluations_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save combined results
-        combined_results = {
-            'main_pipeline': main_metrics,
-            'stacked_model': stacked_metrics,
-            'comparison': comparison
-        }
-        
-        results_path = evaluations_dir / "comparison_results.json"
-        with open(results_path, 'w') as f:
-            json.dump(combined_results, f, indent=2)
-        
-        self.logger.info(f"Saved comparison results to {results_path}")
-        
-        # Generate comparison report
-        self.generate_comparison_report(combined_results, output_dir)
+
     
-    def generate_comparison_report(self,
-                                  results: Dict[str, Any],
-                                  output_dir: str) -> str:
+    def generate_evaluation_visualizations(self,
+                                         test_annotations: List[Any],
+                                         predict_image_func: Callable[[str], Tuple[int, List[Tuple[float, float]]]],
+                                         data_loader: Any,
+                                         metrics: Dict[str, float],
+                                         output_dir: str) -> None:
         """
-        Generate human-readable comparison report.
+        Generate comprehensive evaluation visualizations.
         
         Args:
-            results: Combined results dictionary
-            output_dir: Output directory
-            
-        Returns:
-            Path to generated report
+            test_annotations: List of test ImageAnnotation objects
+            predict_image_func: Function for generating predictions
+            data_loader: DataLoader instance for loading images
+            metrics: Computed metrics dictionary
+            output_dir: Directory to save visualizations
         """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        from pathlib import Path
+        
         output_path = Path(output_dir)
-        evaluations_dir = output_path / "evaluations"
-        evaluations_dir.mkdir(parents=True, exist_ok=True)
+        output_path.mkdir(parents=True, exist_ok=True)
         
-        report_path = evaluations_dir / "comparison_report.txt"
+        # 1. Generate count accuracy bar chart
+        self.logger.info("Generating count accuracy visualization...")
+        self._generate_count_accuracy_chart(metrics, output_path)
         
-        main = results['main_pipeline']
-        stacked = results['stacked_model']
-        comp = results['comparison']
+        # 2. Generate coordinate error histogram
+        self.logger.info("Generating coordinate error histogram...")
+        self._generate_coordinate_error_histogram(test_annotations, predict_image_func, output_path)
         
-        with open(report_path, 'w') as f:
-            f.write("Nurdle Detection Pipeline - Model Comparison Report\n")
-            f.write("=" * 60 + "\n\n")
-            
-            f.write("MAIN PIPELINE (SVM + SVR):\n")
-            f.write("-" * 30 + "\n")
-            f.write(f"  F1-Score: {main['f1_score']:.3f}\n")
-            f.write(f"  Precision: {main['precision']:.3f}\n")
-            f.write(f"  Recall: {main['recall']:.3f}\n")
-            f.write(f"  Avg Coordinate Error: {main['avg_coordinate_error']:.1f} pixels\n")
-            f.write(f"  Count MAE: {main['count_mae']:.1f}\n\n")
-            
-            f.write("STACKED MODEL (SVM + SVR + Meta-Learner):\n")
-            f.write("-" * 30 + "\n")
-            f.write(f"  F1-Score: {stacked['f1_score']:.3f}\n")
-            f.write(f"  Precision: {stacked['precision']:.3f}\n")
-            f.write(f"  Recall: {stacked['recall']:.3f}\n")
-            f.write(f"  Avg Coordinate Error: {stacked['avg_coordinate_error']:.1f} pixels\n")
-            f.write(f"  Count MAE: {stacked['count_mae']:.1f}\n\n")
-            
-            f.write("IMPROVEMENT (Stacked vs Main):\n")
-            f.write("-" * 30 + "\n")
-            f.write(f"  F1-Score: {comp['f1_improvement']:+.3f} ({comp['f1_improvement']/main['f1_score']*100:+.1f}%)\n")
-            f.write(f"  Precision: {comp['precision_improvement']:+.3f}\n")
-            f.write(f"  Recall: {comp['recall_improvement']:+.3f}\n")
-            f.write(f"  Coordinate Error: {comp['coord_error_improvement']:+.1f} pixels\n\n")
-            
-            # Determine winner
-            if comp['f1_improvement'] > 0.01 and comp['coord_error_improvement'] > 0.5:
-                winner = "Stacked Model (significant improvement)"
-            elif comp['f1_improvement'] < -0.01 or comp['coord_error_improvement'] < -0.5:
-                winner = "Main Pipeline (stacking degraded performance)"
-            else:
-                winner = "Similar performance (no clear winner)"
-            
-            f.write(f"CONCLUSION: {winner}\n")
+        # 3. Generate detection examples for all test images
+        self.logger.info("Generating detection examples...")
+        predictions_dir = output_path / 'predictions'
+        predictions_dir.mkdir(exist_ok=True)
         
-        self.logger.info(f"Generated comparison report: {report_path}")
-        return str(report_path)
+        for annotation in test_annotations:
+            try:
+                predicted_count, predicted_coords = predict_image_func(annotation.image_path)
+                actual_coords = annotation.coordinates.tolist() if hasattr(annotation.coordinates, 'tolist') else list(annotation.coordinates)
+                
+                self._create_detection_visualization(
+                    image_path=annotation.image_path,
+                    ground_truth_coords=actual_coords,
+                    predicted_coords=predicted_coords,
+                    data_loader=data_loader,
+                    output_path=predictions_dir / f"{Path(annotation.image_path).stem}_detection.png"
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not generate detection visualization for {annotation.image_path}: {e}")
+        
+        # 4. Generate metrics summary visualization
+        self.logger.info("Generating metrics summary...")
+        self._generate_metrics_summary(metrics, output_path)
+        
+        self.logger.info(f"All evaluation visualizations saved to {output_path}")
+    
+    def _generate_count_accuracy_chart(self, metrics: Dict[str, float], output_dir: Path) -> None:
+        """Generate bar chart showing count prediction metrics."""
+        import matplotlib.pyplot as plt
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        metric_names = ['Accuracy', 'MAE', 'RMSE']
+        metric_values = [
+            metrics.get('count_accuracy', 0),
+            metrics.get('count_mae', 0),
+            metrics.get('count_rmse', 0)
+        ]
+        
+        colors = ['#2ecc71', '#e74c3c', '#f39c12']
+        bars = ax.bar(metric_names, metric_values, color=colors, alpha=0.7, edgecolor='black')
+        
+        # Add value labels on bars
+        for bar, value in zip(bars, metric_values):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{value:.3f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+        
+        ax.set_ylabel('Value', fontsize=12)
+        ax.set_title('Count Prediction Metrics', fontsize=14, fontweight='bold')
+        ax.set_ylim(0, max(metric_values) * 1.15)
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / 'count_metrics.png', dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    def _generate_coordinate_error_histogram(self, test_annotations: List[Any],
+                                           predict_image_func: Callable,
+                                           output_dir: Path) -> None:
+        """Generate histogram of coordinate prediction errors."""
+        import matplotlib.pyplot as plt
+        
+        all_errors = []
+        
+        for annotation in test_annotations:
+            try:
+                predicted_count, predicted_coords = predict_image_func(annotation.image_path)
+                actual_coords = annotation.coordinates.tolist() if hasattr(annotation.coordinates, 'tolist') else list(annotation.coordinates)
+                
+                coord_errors, _, _, _ = self.coordinate_matcher.match_coordinates(
+                    predicted_coords, actual_coords
+                )
+                all_errors.extend(coord_errors)
+            except Exception as e:
+                continue
+        
+        if not all_errors:
+            self.logger.warning("No coordinate errors to visualize")
+            return
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        ax.hist(all_errors, bins=30, color='#3498db', alpha=0.7, edgecolor='black')
+        
+        # Add statistics lines
+        mean_error = np.mean(all_errors)
+        median_error = np.median(all_errors)
+        
+        ax.axvline(mean_error, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_error:.2f}px')
+        ax.axvline(median_error, color='green', linestyle='--', linewidth=2, label=f'Median: {median_error:.2f}px')
+        
+        ax.set_xlabel('Coordinate Error (pixels)', fontsize=12)
+        ax.set_ylabel('Frequency', fontsize=12)
+        ax.set_title('Distribution of Coordinate Prediction Errors', fontsize=14, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / 'coordinate_error_histogram.png', dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    def _create_detection_visualization(self, image_path: str,
+                                      ground_truth_coords: List[Tuple[float, float]],
+                                      predicted_coords: List[Tuple[float, float]],
+                                      data_loader: Any,
+                                      output_path: Path) -> None:
+        """Create visualization showing ground truth vs predictions for a single image."""
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        
+        # Load image
+        image = data_loader.load_image(image_path)
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.imshow(image, cmap='gray')
+        
+        # Draw ground truth (green circles)
+        for x, y in ground_truth_coords:
+            circle = plt.Circle((x, y), radius=15, color='lime', fill=False, linewidth=2)
+            ax.add_patch(circle)
+        
+        # Draw predictions (red circles)
+        for x, y in predicted_coords:
+            circle = plt.Circle((x, y), radius=12, color='red', fill=False, linewidth=2, linestyle='--')
+            ax.add_patch(circle)
+        
+        # Add legend
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='lime', markersize=10, label='Ground Truth'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='Predictions', linestyle='--')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+        
+        # Add title with counts
+        img_name = Path(image_path).stem
+        ax.set_title(f'{img_name}\nGT: {len(ground_truth_coords)} | Predicted: {len(predicted_coords)}',
+                    fontsize=12, fontweight='bold')
+        ax.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    def _generate_metrics_summary(self, metrics: Dict[str, float], output_dir: Path) -> None:
+        """Generate comprehensive metrics summary visualization."""
+        import matplotlib.pyplot as plt
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Evaluation Metrics Summary', fontsize=16, fontweight='bold')
+        
+        # Detection metrics (top-left)
+        ax1 = axes[0, 0]
+        detection_names = ['Precision', 'Recall', 'F1-Score']
+        detection_values = [
+            metrics.get('precision', 0),
+            metrics.get('recall', 0),
+            metrics.get('f1_score', 0)
+        ]
+        bars1 = ax1.bar(detection_names, detection_values, color=['#3498db', '#e74c3c', '#2ecc71'], alpha=0.7, edgecolor='black')
+        for bar, value in zip(bars1, detection_values):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height, f'{value:.3f}',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+        ax1.set_ylabel('Score', fontsize=11)
+        ax1.set_title('Detection Performance', fontsize=12, fontweight='bold')
+        ax1.set_ylim(0, 1.1)
+        ax1.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        # Count metrics (top-right)
+        ax2 = axes[0, 1]
+        count_names = ['Accuracy', 'MAE', 'RMSE']
+        count_values = [
+            metrics.get('count_accuracy', 0),
+            metrics.get('count_mae', 0) / 10,  # Scale for visualization
+            metrics.get('count_rmse', 0) / 10
+        ]
+        bars2 = ax2.bar(count_names, count_values, color=['#9b59b6', '#f39c12', '#e67e22'], alpha=0.7, edgecolor='black')
+        for bar, value, actual in zip(bars2, count_values, [metrics.get('count_accuracy', 0), metrics.get('count_mae', 0), metrics.get('count_rmse', 0)]):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height, f'{actual:.2f}',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+        ax2.set_ylabel('Value (scaled)', fontsize=11)
+        ax2.set_title('Count Prediction Metrics', fontsize=12, fontweight='bold')
+        ax2.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        # Coordinate error stats (bottom-left)
+        ax3 = axes[1, 0]
+        coord_names = ['Mean', 'Median', 'Std', 'Max']
+        coord_values = [
+            metrics.get('avg_coordinate_error', 0),
+            metrics.get('median_coordinate_error', 0),
+            metrics.get('std_coordinate_error', 0),
+            metrics.get('max_coordinate_error', 0)
+        ]
+        bars3 = ax3.bar(coord_names, coord_values, color='#1abc9c', alpha=0.7, edgecolor='black')
+        for bar, value in zip(bars3, coord_values):
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height, f'{value:.1f}',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+        ax3.set_ylabel('Error (pixels)', fontsize=11)
+        ax3.set_title('Coordinate Error Statistics', fontsize=12, fontweight='bold')
+        ax3.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        # Detection counts (bottom-right)
+        ax4 = axes[1, 1]
+        detection_count_names = ['True Pos', 'False Pos', 'False Neg']
+        detection_count_values = [
+            metrics.get('true_positives', 0),
+            metrics.get('false_positives', 0),
+            metrics.get('false_negatives', 0)
+        ]
+        bars4 = ax4.bar(detection_count_names, detection_count_values,
+                       color=['#2ecc71', '#e74c3c', '#f39c12'], alpha=0.7, edgecolor='black')
+        for bar, value in zip(bars4, detection_count_values):
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height, f'{int(value)}',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+        ax4.set_ylabel('Count', fontsize=11)
+        ax4.set_title('Detection Breakdown', fontsize=12, fontweight='bold')
+        ax4.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / 'metrics_summary.png', dpi=150, bbox_inches='tight')
+        plt.close()
     
     def _log_evaluation_results(self, metrics: Dict[str, float]) -> None:
         """Log evaluation results to console."""

@@ -1,6 +1,6 @@
 """Models package initialization."""
 
 from .model_trainer import ModelTrainer
-from .stacked_model import StackedNurdleDetector
+from .prediction_engine import PredictionEngine
 
-__all__ = ['ModelTrainer', 'StackedNurdleDetector']
+__all__ = ['ModelTrainer', 'PredictionEngine']

@@ -30,18 +30,21 @@ class NonMaximumSuppression:
         self.default_min_distance = default_min_distance
     
     def apply_nms(self, 
-                  detections: List[Tuple[float, float, float]], 
+                  detections: List[Tuple[float, float]], 
+                  offsets: Optional[List[Tuple[float, float]]] = None,
                   iou_threshold: Optional[float] = None,
-                  min_distance: Optional[float] = None) -> List[Tuple[float, float, float]]:
+                  min_distance: Optional[float] = None) -> List[Tuple[float, float]]:
         """
-        Apply Non-Maximum Suppression to remove overlapping detections.
+        Apply Non-Maximum Suppression using SVR offset magnitude.
         
-        For point detections (nurdles), we use distance-based suppression
-        rather than traditional bounding box IoU.
+        Strategy: Among nearby detections (within min_distance), keep the one
+        with smallest offset magnitude (most centered on the actual nurdle).
+        This leverages the SVR's predicted offset as a natural confidence metric.
         
         Args:
-            detections: List of (x, y, confidence) tuples
-            iou_threshold: IoU threshold for suppression (not used in distance-based NMS)
+            detections: List of (x, y) tuples
+            offsets: List of (offset_x, offset_y) tuples from SVR predictions
+            iou_threshold: IoU threshold (not used in offset-magnitude NMS)
             min_distance: Minimum distance between detections (pixels)
         
         Returns:
@@ -53,30 +56,61 @@ class NonMaximumSuppression:
         if min_distance is None:
             min_distance = self.default_min_distance
         
-        # Sort by confidence (highest first)
-        sorted_detections = sorted(detections, key=lambda x: x[2], reverse=True)
-        
-        keep = []
-        remaining = sorted_detections.copy()
-        
-        while remaining:
-            # Keep the highest confidence detection
-            current = remaining.pop(0)
-            keep.append(current)
+        # If no offsets provided, fall back to simple processing order
+        if offsets is None or len(offsets) != len(detections):
+            keep = []
+            remaining = detections.copy()
             
-            # Remove overlapping detections
-            filtered_remaining = []
-            for det in remaining:
-                # Calculate distance between current and candidate detection
-                distance = self._calculate_distance(current, det)
+            while remaining:
+                current = remaining.pop(0)
+                keep.append(current)
                 
-                # If detections are far enough apart, keep the candidate
-                if distance > min_distance:
-                    filtered_remaining.append(det)
+                filtered_remaining = []
+                for det in remaining:
+                    distance = self._calculate_distance(current, det)
+                    if distance > min_distance:
+                        filtered_remaining.append(det)
+                
+                remaining = filtered_remaining
             
-            remaining = filtered_remaining
+            return keep
         
-        return keep
+        # Offset-magnitude-based NMS with radius-based overlap
+        # Calculate offset magnitudes (distance from window center to predicted nurdle)
+        magnitudes = [np.sqrt(ox**2 + oy**2) for ox, oy in offsets]
+        
+        # Sort by offset magnitude (smallest = most centered on nurdle)
+        sorted_indices = np.argsort(magnitudes)
+        
+        kept_detections = []
+        kept_magnitudes = []
+        
+        # Use min_distance as the nurdle radius for overlap calculation
+        nurdle_radius = min_distance
+        
+        for idx in sorted_indices:
+            detection = detections[idx]
+            magnitude = magnitudes[idx]
+            
+            # Check if this detection's radius overlaps with any kept detection
+            is_duplicate = False
+            for kept_detection, kept_magnitude in zip(kept_detections, kept_magnitudes):
+                # Distance between detection centers
+                center_distance = self._calculate_distance(detection, kept_detection)
+                
+                # Two circles overlap if distance < sum of radii
+                # But since both detections represent the same nurdle size, use 2*radius
+                # Actually: overlap if center_distance < nurdle_radius (aggressive suppression)
+                # This means: if two predicted centers are within one radius, they're duplicates
+                if center_distance < nurdle_radius:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                kept_detections.append(detection)
+                kept_magnitudes.append(magnitude)
+        
+        return kept_detections
     
     def apply_nms_with_boxes(self, 
                            detections: List[Tuple[float, float, float, float, float]], 
@@ -220,8 +254,8 @@ class NonMaximumSuppression:
         return result
     
     def _calculate_distance(self, 
-                          det1: Tuple[float, float, float], 
-                          det2: Tuple[float, float, float]) -> float:
+                          det1: Tuple[float, float], 
+                          det2: Tuple[float, float]) -> float:
         """Calculate Euclidean distance between two point detections."""
         return np.sqrt((det1[0] - det2[0])**2 + (det1[1] - det2[1])**2)
     

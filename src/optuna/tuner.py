@@ -16,6 +16,7 @@ from typing import Dict, Any, Callable, Tuple, List
 import joblib
 import json
 from datetime import datetime
+from tqdm import tqdm
 
 # Visualization imports (with fallback)
 try:
@@ -132,9 +133,21 @@ class OptunaTuner:
                 self.logger.error(f"Trial failed: {e}")
                 return 0.0
         
-        # Run optimization
-        n_trials = 20
-        study.optimize(objective, n_trials=n_trials)
+        # Run optimization with progress bar
+        n_trials = self.config.get('svm_optimization', {}).get('n_trials', 10)
+        
+        # Suppress optuna logging during trials
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        with tqdm(total=n_trials, desc="SVM Optimization", unit="trial") as pbar:
+            def callback(study, trial):
+                pbar.update(1)
+                pbar.set_postfix({"best_f1": f"{study.best_value:.4f}"})
+            
+            study.optimize(objective, n_trials=n_trials, callbacks=[callback], show_progress_bar=False)
+        
+        # Restore optuna logging
+        optuna.logging.set_verbosity(optuna.logging.INFO)
         
         best_svm_params = study.best_params
         self.logger.info(f"Best SVM F1-Score: {study.best_value:.4f}")
@@ -197,9 +210,21 @@ class OptunaTuner:
                 self.logger.error(f"Trial failed: {e}")
                 return 1000.0  # Large error for failed trials
         
-        # Run optimization
-        n_trials = 20
-        study.optimize(objective, n_trials=n_trials)
+        # Run optimization with progress bar
+        n_trials = self.config.get('svr_optimization', {}).get('n_trials', 10)
+        
+        # Suppress optuna logging during trials
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        with tqdm(total=n_trials, desc="SVR Optimization", unit="trial") as pbar:
+            def callback(study, trial):
+                pbar.update(1)
+                pbar.set_postfix({"best_error": f"{study.best_value:.2f}px"})
+            
+            study.optimize(objective, n_trials=n_trials, callbacks=[callback], show_progress_bar=False)
+        
+        # Restore optuna logging
+        optuna.logging.set_verbosity(optuna.logging.INFO)
         
         best_svr_params = study.best_params
         self.logger.info(f"Best SVR Coordinate Error: {study.best_value:.2f} pixels")
@@ -252,7 +277,7 @@ class OptunaTuner:
         return best_combined_params
     
     def _save_optimization_results(self, study, output_path: Path):
-        """Save optimization results for a single study."""
+        """Save optimization results and visualizations for a single study."""
         try:
             output_path.mkdir(parents=True, exist_ok=True)
             
@@ -269,9 +294,125 @@ class OptunaTuner:
                     'n_trials': len(study.trials)
                 }, f, indent=2)
             
+            # Generate visualizations (PNG only)
+            if VISUALIZATION_AVAILABLE and PLOTLY_AVAILABLE:
+                try:
+                    # Optimization history
+                    fig_history = plot_optimization_history(study)
+                    fig_history.write_image(str(output_path / "optimization_history.png"))
+                    self.logger.info("Saved optimization history plot")
+                    
+                    # Parameter importances
+                    if len(study.trials) > 1:
+                        fig_importance = plot_param_importances(study)
+                        fig_importance.write_image(str(output_path / "param_importances.png"))
+                        self.logger.info("Saved parameter importances plot")
+                    
+                    # Slice plot (parameter relationships)
+                    if len(study.trials) > 1:
+                        fig_slice = plot_slice(study)
+                        fig_slice.write_image(str(output_path / "param_slice.png"))
+                        self.logger.info("Saved parameter slice plot")
+                    
+                except Exception as viz_error:
+                    self.logger.warning(f"Could not generate visualizations: {viz_error}")
+            else:
+                self.logger.warning("Optuna visualization libraries not available, skipping plots")
+            
             self.logger.info(f"Saved optimization results to {output_path}")
         except Exception as e:
             self.logger.error(f"Error saving optimization results: {e}")
+    
+    def create_training_callback(self, config, feature_extractor, data_loader):
+        """
+        Create training and evaluation function for Optuna optimization.
+        
+        This callback temporarily updates configuration, trains models,
+        evaluates on validation data, and returns optimization metrics.
+        
+        Args:
+            config: Pipeline configuration dictionary
+            feature_extractor: FeatureExtractor instance
+            data_loader: DataLoader instance
+            
+        Returns:
+            Callable that takes trial parameters and returns metrics dict
+        """
+        from src.models.model_trainer import ModelTrainer
+        from src.evaluation.metrics import calculate_all_metrics
+        
+        def train_and_evaluate(trial_params: Dict[str, Any]) -> Dict[str, float]:
+            """Train models with trial parameters and evaluate."""
+            # Suppress logging during trials to reduce noise
+            logging.disable(logging.INFO)
+            
+            try:
+                # Create trial config with hyperparameters
+                trial_config = config.copy()
+                trial_config['training'].update(trial_params)
+                
+                # Train models with trial config
+                trainer = ModelTrainer(trial_config, self.logger)
+                
+                # Load training data
+                X_train = feature_extractor.training_features
+                y_train = feature_extractor.training_labels
+                
+                if X_train is None or len(X_train) == 0:
+                    raise ValueError("No training features available")
+                
+                trainer.train_models(X_train, y_train)
+                
+                # Evaluate on validation set
+                val_images = data_loader.validation_image_names if hasattr(data_loader, 'validation_image_names') else data_loader.test_image_names[:3]
+                
+                all_predictions = []
+                all_ground_truths = []
+                
+                for img_name in val_images:
+                    image_path = data_loader.normalized_data_dir / 'images' / f"{img_name}.jpg"
+                    annotations = data_loader.annotations.get(img_name, [])
+                    
+                    if not image_path.exists():
+                        continue
+                    
+                    # Get ground truth
+                    ground_truth = [(ann['x'], ann['y']) for ann in annotations if ann.get('x') is not None]
+                    all_ground_truths.extend(ground_truth)
+                    
+                    # Predict (simplified for validation)
+                    img = data_loader.load_image(str(image_path))
+                    windows = feature_extractor.generate_windows_for_image(img)
+                    
+                    if len(windows) == 0:
+                        continue
+                    
+                    features = feature_extractor.extract_hog_lbp_features_batch([w['data'] for w in windows])
+                    predictions_raw = trainer.predict(features)
+                    
+                    # Simple filtering
+                    mask = predictions_raw[:, 0] > 0.5
+                    predictions = [(windows[i]['x'] + predictions_raw[i, 1], 
+                                   windows[i]['y'] + predictions_raw[i, 2]) 
+                                  for i in range(len(windows)) if mask[i]]
+                    all_predictions.extend(predictions)
+                
+                # Calculate metrics
+                metrics = calculate_all_metrics(all_predictions, all_ground_truths, distance_threshold=20)
+                
+                return {
+                    'f1_score': metrics.get('f1_score', 0.0),
+                    'avg_coordinate_error': metrics.get('avg_coordinate_error', 1000.0)
+                }
+                
+            except Exception as e:
+                self.logger.error(f"Training callback failed: {e}")
+                return {'f1_score': 0.0, 'avg_coordinate_error': 1000.0}
+            finally:
+                # Re-enable logging
+                logging.disable(logging.NOTSET)
+        
+        return train_and_evaluate
     
     def load_best_parameters(self, output_dir: str) -> Dict[str, Any]:
         """Load previously optimized parameters."""
