@@ -35,7 +35,7 @@ class ModelEvaluator:
                        test_annotations: List[Any],
                        predict_image_func: Callable[[str], Tuple[int, List[Tuple[float, float]]]]) -> Dict[str, float]:
         """
-        Evaluate models on test set.
+        Evaluate models on test set (combined two-stage approach).
         
         Args:
             test_annotations: List of ImageAnnotation objects for testing
@@ -95,6 +95,276 @@ class ModelEvaluator:
         self._log_evaluation_results(metrics)
         
         return metrics
+    
+    def evaluate_models_detailed(self,
+                                test_annotations: List[Any],
+                                prediction_engine: Any,
+                                data_loader: Any) -> Dict[str, Any]:
+        """
+        Evaluate models with detailed breakdown: SVM only, SVR only, and combined.
+        
+        Args:
+            test_annotations: List of ImageAnnotation objects for testing
+            prediction_engine: PredictionEngine instance with trained models
+            data_loader: DataLoader instance for loading images
+        
+        Returns:
+            Dictionary with separate metrics for SVM, SVR, and combined approach
+        """
+        self.logger.info("Performing detailed model evaluation (SVM + SVR + Combined)...")
+        
+        results = {
+            'svm_only': self._evaluate_svm_only(test_annotations, prediction_engine, data_loader),
+            'svr_refinement': {},  # Will be populated with SVR contribution analysis
+            'combined': {}  # Will be populated with full pipeline metrics
+        }
+        
+        # Evaluate combined approach (already done in evaluate_models)
+        self.logger.info("Evaluating combined two-stage approach...")
+        count_predictions = []
+        count_ground_truth = []
+        coordinate_errors = []
+        svr_offset_magnitudes = []  # Track SVR offset magnitudes
+        detection_stats = {
+            'true_positives': 0,
+            'false_positives': 0,
+            'false_negatives': 0
+        }
+        
+        for annotation in test_annotations:
+            try:
+                # Get combined predictions
+                predicted_count, predicted_coords = prediction_engine.predict_image_from_path(
+                    annotation.image_path,
+                    data_loader,
+                    prediction_engine.nms.default_iou_threshold
+                )
+                
+                actual_count = annotation.nurdle_count
+                actual_coords = annotation.coordinates
+                
+                count_predictions.append(predicted_count)
+                count_ground_truth.append(actual_count)
+                
+                # Calculate coordinate matching and detection statistics
+                actual_coords_list = actual_coords.tolist() if hasattr(actual_coords, 'tolist') else list(actual_coords)
+                
+                if len(actual_coords_list) > 0 or len(predicted_coords) > 0:
+                    coord_errors, tp, fp, fn = self.coordinate_matcher.match_coordinates(
+                        predicted_coords, actual_coords_list
+                    )
+                    
+                    coordinate_errors.extend(coord_errors)
+                    detection_stats['true_positives'] += tp
+                    detection_stats['false_positives'] += fp
+                    detection_stats['false_negatives'] += fn
+                
+            except Exception as e:
+                self.logger.error(f"Error evaluating combined approach for {annotation.image_path}: {e}")
+                continue
+        
+        results['combined'] = self.metrics_calculator.calculate_all_metrics(
+            count_ground_truth=count_ground_truth,
+            count_predictions=count_predictions,
+            coordinate_errors=coordinate_errors,
+            detection_stats=detection_stats,
+            n_test_images=len(test_annotations)
+        )
+        
+        # Analyze SVR contribution
+        results['svr_refinement'] = self._analyze_svr_contribution(
+            test_annotations, prediction_engine, data_loader
+        )
+        
+        # Log detailed results
+        self._log_detailed_evaluation_results(results)
+        
+        return results
+    
+    def _evaluate_svm_only(self,
+                          test_annotations: List[Any],
+                          prediction_engine: Any,
+                          data_loader: Any) -> Dict[str, Any]:
+        """
+        Evaluate SVM classifier detection performance only (no coordinate accuracy).
+        
+        Measures: Precision, Recall, F1, TP, FP, FN after NMS filtering.
+        Does NOT measure coordinate accuracy since SVM only does classification.
+        
+        Args:
+            test_annotations: List of ImageAnnotation objects
+            prediction_engine: PredictionEngine instance
+            data_loader: DataLoader instance
+        
+        Returns:
+            Dictionary with SVM detection metrics only
+        """
+        self.logger.info("Evaluating SVM classifier detection performance...")
+        
+        detection_stats = {
+            'true_positives': 0,
+            'false_positives': 0,
+            'false_negatives': 0,
+            'total_svm_positives': 0,  # Before NMS
+            'total_after_nms': 0        # After NMS
+        }
+        
+        for annotation in test_annotations:
+            try:
+                image = data_loader.load_image(annotation.image_path)
+                h, w = image.shape[:2]
+                
+                window_size = prediction_engine.feature_extractor.window_size
+                window_stride = prediction_engine.feature_extractor.window_stride
+                
+                positive_windows = []
+                
+                # Slide window and collect SVM positive predictions
+                for y in range(0, h - window_size[1] + 1, window_stride):
+                    for x in range(0, w - window_size[0] + 1, window_stride):
+                        window = image[y:y+window_size[1], x:x+window_size[0]]
+                        
+                        if window.shape[:2] == tuple(window_size):
+                            features = prediction_engine.feature_extractor.extract_hog_lbp_features(window)
+                            features_2d = features.reshape(1, -1)
+                            is_nurdle = prediction_engine.model_trainer.svm_classifier.predict(features_2d)[0]
+                            
+                            if is_nurdle:
+                                confidence = prediction_engine.model_trainer.svm_classifier.predict_proba(features_2d)[0][1]
+                                box = (x, y, x + window_size[0], y + window_size[1], confidence)
+                                window_center_x = x + window_size[0] / 2.0
+                                window_center_y = y + window_size[1] / 2.0
+                                positive_windows.append((box, window_center_x, window_center_y))
+                
+                detection_stats['total_svm_positives'] += len(positive_windows)
+                
+                # Apply NMS on positive windows
+                if positive_windows:
+                    boxes_for_nms = [pw[0] for pw in positive_windows]
+                    filtered_boxes = prediction_engine.nms.apply_nms_with_boxes(
+                        boxes_for_nms,
+                        iou_threshold=prediction_engine.nms.default_iou_threshold
+                    )
+                    
+                    # Get window centers for filtered boxes
+                    svm_predictions = []
+                    for filtered_box in filtered_boxes:
+                        for box, cx, cy in positive_windows:
+                            if box == filtered_box:
+                                svm_predictions.append((cx, cy))
+                                break
+                else:
+                    svm_predictions = []
+                
+                detection_stats['total_after_nms'] += len(svm_predictions)
+                
+                # Calculate detection matching (TP, FP, FN only - no coordinate errors)
+                actual_coords = annotation.coordinates
+                actual_coords_list = actual_coords.tolist() if hasattr(actual_coords, 'tolist') else list(actual_coords)
+                
+                if len(actual_coords_list) > 0 or len(svm_predictions) > 0:
+                    _, tp, fp, fn = self.coordinate_matcher.match_coordinates(
+                        svm_predictions, actual_coords_list
+                    )
+                    
+                    detection_stats['true_positives'] += tp
+                    detection_stats['false_positives'] += fp
+                    detection_stats['false_negatives'] += fn
+                
+            except Exception as e:
+                self.logger.error(f"Error evaluating SVM-only for {annotation.image_path}: {e}")
+                continue
+        
+        # Calculate only detection metrics (no coordinate or count metrics)
+        return self.metrics_calculator.calculate_detection_metrics(detection_stats)
+    
+    def _analyze_svr_contribution(self,
+                                 test_annotations: List[Any],
+                                 prediction_engine: Any,
+                                 data_loader: Any) -> Dict[str, Any]:
+        """
+        Analyze SVR's contribution to coordinate refinement.
+        
+        Args:
+            test_annotations: List of ImageAnnotation objects
+            prediction_engine: PredictionEngine instance
+            data_loader: DataLoader instance
+        
+        Returns:
+            Dictionary with SVR contribution analysis
+        """
+        self.logger.info("Analyzing SVR coordinate refinement contribution...")
+        
+        offset_magnitudes = []
+        improvements = []  # How much SVR improved coordinate error
+        
+        for annotation in test_annotations:
+            try:
+                image = data_loader.load_image(annotation.image_path)
+                h, w = image.shape[:2]
+                
+                window_size = prediction_engine.feature_extractor.window_size
+                window_stride = prediction_engine.feature_extractor.window_stride
+                
+                actual_coords = annotation.coordinates
+                actual_coords_list = actual_coords.tolist() if hasattr(actual_coords, 'tolist') else list(actual_coords)
+                
+                # Collect positive windows with both SVM and SVR predictions
+                for y in range(0, h - window_size[1] + 1, window_stride):
+                    for x in range(0, w - window_size[0] + 1, window_stride):
+                        window = image[y:y+window_size[1], x:x+window_size[0]]
+                        
+                        if window.shape[:2] == tuple(window_size):
+                            features = prediction_engine.feature_extractor.extract_hog_lbp_features(window)
+                            features_2d = features.reshape(1, -1)
+                            is_nurdle = prediction_engine.model_trainer.svm_classifier.predict(features_2d)[0]
+                            
+                            if is_nurdle:
+                                # Window center (SVM prediction)
+                                window_center_x = x + window_size[0] / 2.0
+                                window_center_y = y + window_size[1] / 2.0
+                                
+                                # SVR refinement
+                                offsets = prediction_engine.model_trainer.svr_regressor.predict(features_2d)[0]
+                                offset_x, offset_y = offsets[0], offsets[1]
+                                offset_magnitude = np.sqrt(offset_x**2 + offset_y**2)
+                                offset_magnitudes.append(offset_magnitude)
+                                
+                                # Refined coordinates
+                                refined_x = window_center_x + offset_x
+                                refined_y = window_center_y + offset_y
+                                
+                                # Find nearest ground truth
+                                if actual_coords_list:
+                                    min_dist_before = float('inf')
+                                    min_dist_after = float('inf')
+                                    
+                                    for gt_x, gt_y in actual_coords_list:
+                                        dist_before = np.sqrt((window_center_x - gt_x)**2 + (window_center_y - gt_y)**2)
+                                        dist_after = np.sqrt((refined_x - gt_x)**2 + (refined_y - gt_y)**2)
+                                        
+                                        if dist_before < min_dist_before:
+                                            min_dist_before = dist_before
+                                        if dist_after < min_dist_after:
+                                            min_dist_after = dist_after
+                                    
+                                    improvement = min_dist_before - min_dist_after
+                                    improvements.append(improvement)
+                
+            except Exception as e:
+                self.logger.error(f"Error analyzing SVR for {annotation.image_path}: {e}")
+                continue
+        
+        return {
+            'avg_offset_magnitude': float(np.mean(offset_magnitudes)) if offset_magnitudes else 0.0,
+            'median_offset_magnitude': float(np.median(offset_magnitudes)) if offset_magnitudes else 0.0,
+            'max_offset_magnitude': float(np.max(offset_magnitudes)) if offset_magnitudes else 0.0,
+            'avg_improvement': float(np.mean(improvements)) if improvements else 0.0,
+            'median_improvement': float(np.median(improvements)) if improvements else 0.0,
+            'positive_improvements': int(np.sum(np.array(improvements) > 0)) if improvements else 0,
+            'negative_improvements': int(np.sum(np.array(improvements) < 0)) if improvements else 0,
+            'total_predictions': len(improvements)
+        }
     
 
     
@@ -453,3 +723,57 @@ class ModelEvaluator:
         self.logger.info(f"  Precision: {metrics.get('precision', 0):.3f}")
         self.logger.info(f"  Recall: {metrics.get('recall', 0):.3f}")
         self.logger.info(f"  F1-Score: {metrics.get('f1_score', 0):.3f}")
+    
+    def _log_detailed_evaluation_results(self, results: Dict[str, Any]) -> None:
+        """Log detailed evaluation results with component breakdown."""
+        self.logger.info("="*80)
+        self.logger.info("DETAILED EVALUATION RESULTS")
+        self.logger.info("="*80)
+        
+        # SVM Only
+        self.logger.info("\n[1] SVM CLASSIFIER DETECTION PERFORMANCE:")
+        svm = results['svm_only']
+        self.logger.info(f"  Precision: {svm.get('precision', 0):.3f}")
+        self.logger.info(f"  Recall: {svm.get('recall', 0):.3f}")
+        self.logger.info(f"  F1-Score: {svm.get('f1_score', 0):.3f}")
+        self.logger.info(f"  True Positives: {svm.get('true_positives', 0)}")
+        self.logger.info(f"  False Positives: {svm.get('false_positives', 0)}")
+        self.logger.info(f"  False Negatives: {svm.get('false_negatives', 0)}")
+        self.logger.info(f"  Total SVM Positives (before NMS): {svm.get('total_svm_positives', 0)}")
+        self.logger.info(f"  Total After NMS: {svm.get('total_after_nms', 0)}")
+        
+        # SVR Contribution
+        self.logger.info("\n[2] SVR COORDINATE REFINEMENT ANALYSIS:")
+        svr = results['svr_refinement']
+        self.logger.info(f"  Avg Offset Magnitude: {svr.get('avg_offset_magnitude', 0):.2f} pixels")
+        self.logger.info(f"  Median Offset Magnitude: {svr.get('median_offset_magnitude', 0):.2f} pixels")
+        self.logger.info(f"  Max Offset Magnitude: {svr.get('max_offset_magnitude', 0):.2f} pixels")
+        self.logger.info(f"  Avg Improvement: {svr.get('avg_improvement', 0):+.2f} pixels")
+        pos_pct = 100 * svr.get('positive_improvements', 0) / svr.get('total_predictions', 1)
+        neg_pct = 100 * svr.get('negative_improvements', 0) / svr.get('total_predictions', 1)
+        self.logger.info(f"  Predictions Improved: {svr.get('positive_improvements', 0)} ({pos_pct:.1f}%)")
+        self.logger.info(f"  Predictions Degraded: {svr.get('negative_improvements', 0)} ({neg_pct:.1f}%)")
+        
+        # Combined
+        self.logger.info("\n[3] COMBINED TWO-STAGE APPROACH (SVM + SVR):")
+        combined = results['combined']
+        self.logger.info(f"  Precision: {combined.get('precision', 0):.3f}")
+        self.logger.info(f"  Recall: {combined.get('recall', 0):.3f}")
+        self.logger.info(f"  F1-Score: {combined.get('f1_score', 0):.3f}")
+        self.logger.info(f"  Count MAE: {combined.get('count_mae', 0):.1f}")
+        self.logger.info(f"  Avg Coordinate Error: {combined.get('avg_coordinate_error', 0):.1f} pixels")
+        self.logger.info(f"  True Positives: {combined.get('true_positives', 0)}")
+        self.logger.info(f"  False Positives: {combined.get('false_positives', 0)}")
+        self.logger.info(f"  False Negatives: {combined.get('false_negatives', 0)}")
+        
+        # Comparison
+        self.logger.info("\n[4] KEY INSIGHTS:")
+        f1_change = combined.get('f1_score', 0) - svm.get('f1_score', 0)
+        precision_change = combined.get('precision', 0) - svm.get('precision', 0)
+        recall_change = combined.get('recall', 0) - svm.get('recall', 0)
+        self.logger.info(f"  F1-Score Change (SVM->Combined): {f1_change:+.3f}")
+        self.logger.info(f"  Precision Change: {precision_change:+.3f}")
+        self.logger.info(f"  Recall Change: {recall_change:+.3f}")
+        if svr.get('avg_improvement', 0) < 0:
+            self.logger.info(f"  WARNING: SVR degrades coordinates by {abs(svr.get('avg_improvement', 0)):.2f}px on average")
+        self.logger.info("="*80)

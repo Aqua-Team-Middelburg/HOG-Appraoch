@@ -49,11 +49,8 @@ class OptunaTuner:
         self.logger = logger or logging.getLogger(__name__)
         
         # Optuna configuration
-        self.n_trials = config.get('n_trials', 20)
-        self.tune_thresholds = config.get('tune_thresholds', True)
-        self.save_plots = config.get('save_plots', True)
-        self.optimization_direction = config.get('direction', 'maximize')
-        self.metric_to_optimize = config.get('metric', 'f1_score')
+        # n_trials configured per optimization type (svm_optimization, svr_optimization)
+        # direction and metric are hardcoded per optimization (maximize f1, minimize error)
         
         # Storage for best parameters
         self.best_params = None

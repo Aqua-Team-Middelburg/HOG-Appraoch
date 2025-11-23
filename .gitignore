@@ -171,3 +171,9 @@ Thumbs.db
 *.tmp
 *.temp
 *~
+
+# Sved Output Folder
+saved_outputs/
+
+#random image selector script
+copy_random_images.py

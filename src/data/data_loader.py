@@ -61,7 +61,6 @@ class DataLoader:
         # Configuration parameters
         self.train_test_ratio = config.get('train_test_ratio', 0.8)
         self.target_resolution = config.get('target_resolution', 1080)
-        self.target_nurdle_radius = config.get('target_nurdle_radius', None)
         self.batch_size = config.get('batch_size', 15)
         
         # Data storage

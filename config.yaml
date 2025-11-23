@@ -13,18 +13,15 @@ project:
 data:
   train_test_ratio: 0.8           # Fraction for training (0.8 = 80% train, 20% test)
   target_resolution: 1080         # Target image resolution for normalization
-  target_nurdle_radius: null      # Target nurdle radius in pixels after normalization
-                                  # Images will be scaled so nurdles have this approximate radius
-                                  # Set to null to disable radius-based scaling (use resolution only)
-                                  # Example: 20 means scale images so average nurdle has ~20px radius
   batch_size: 15                  # Images per RAM batch (memory management)
   input_dir: "input"              # Input directory with images and JSON files
   output_dir: "output"            # Output directory for results
+  save_dir: "saved_outputs"       # Directory to save zipped output folders (set to null to disable)
 
 # Window Processing Configuration
 windows:
   size: [20, 20]                  # Window size [width, height]
-  stride: 15                      # Sliding window stride
+  stride: 18                      # Sliding window stride
 
 # Feature Extraction Configuration  
 features:
@@ -38,11 +35,6 @@ training:
                                   # A window is positive if its center is within this radius
                                   # of any nurdle center point
 
-# Stacked Model Configuration (optional advanced mode)
-stacking:
-  enabled: false                  # Set to true to train and evaluate stacked model
-  meta_learner: "logistic_regression"  # or "random_forest"
-
 # Evaluation Configuration  
 evaluation:
   # Test set configuration
@@ -50,84 +42,20 @@ evaluation:
   
   # NMS Configuration
   nms:
-    distance_threshold: 20  # Distance threshold in pixels for center-based NMS (default: 20 pixels, consider as multiplier of expected nurdle radius)
-    # NMS Strategy: Offset-magnitude-based
-    # Among nearby detections, keeps the one with smallest SVR offset magnitude
-    # (most centered on the actual nurdle). This leverages SVR predictions as
-    # a natural confidence metric without requiring separate confidence scoring.
+    iou_threshold: 0.1  # IoU threshold for Non-Maximum Suppression (default: 0.1)
+    # NMS Strategy: IoU-based after SVM classification
+    # Applied to positive SVM windows before SVR processing.
+    # Reduces redundant overlapping windows based on SVM confidence scores.
+    # SVR only processes windows that pass NMS filtering.
+    # Note: With stride=15 and window_size=20, adjacent windows have IoU ~0.11
+    # Set threshold to 0.1 to filter overlapping windows while keeping distinct detections
   
   # Per-model evaluation
   per_model: true  # Enable separate evaluation for each model type
   
-  # Metrics configuration
-  metrics:
-    calculate_mape: true  # Mean Absolute Percentage Error
-    calculate_mae: true   # Mean Absolute Error
-    # Note: Pipeline automatically works with real images and their JSON annotations
-    # Fallback simulation only used if window metadata is missing
-    
-  # Visualization settings
-  visualization:
-    enabled: true  # Whether to generate visualizations
-    
-    # Plot styling
-    figure_size: [12, 8]  # Default figure size (width, height)
-    dpi: 300  # Image resolution for saved plots
-    
-  # Detection parameters
-  detection:
-    threshold: 0.0  # Default SVM decision boundary (will be optimized)
-    iou_threshold: 0.5  # IoU threshold for Non-Maximum Suppression
-    optimize_threshold: true  # Whether to optimize detection threshold
-    threshold_optimization_metric: "f1"  # Metric for threshold optimization
-
-# System Configuration
-system:
-  # Logging configuration
-  logging:
-    level: "INFO"  # "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
-    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    file_logging: true  # Whether to log to file
-    console_logging: true  # Whether to log to console
-    
-  # Performance and resource settings
-  performance:
-    # Parallel processing
-    n_jobs: -1  # Number of parallel jobs (-1 for all cores, 1 for no parallelism)
-    batch_size: 1000  # Batch size for processing large datasets
-    
-  # Reproducibility
-  reproducibility:
-    set_random_seeds: true  # Whether to set random seeds for reproducibility
-    random_seed: 42  # Master random seed
-    
-  # Development and debugging
-  debug:
-    save_intermediate_results: false  # Save intermediate processing results
-    verbose_logging: false  # Enable verbose logging for debugging
-    profile_performance: false  # Enable performance profiling
-
-# Model Management
-model_management:
-  # Model saving and loading
-  save_models: true  # Whether to save trained models
-  model_format: "joblib"  # "joblib" or "pickle"
-  
-  # Model versioning
-  versioning:
-    enabled: true
-    include_timestamp: true  # Include timestamp in model filenames
-    include_config_hash: false  # Include config hash for reproducibility
-    
-  # Model metadata
-  save_metadata: true  # Save model training metadata
-  metadata_format: "json"  # Format for metadata files
-
 # Hyperparameter Optimization Configuration
 optimization:
-  # Sequential optimization strategy
   svm_optimization:
-    metric: "f1_score"
     n_trials: 10
     parameter_ranges:
       svm_c: [0.001, 100.0]  # log scale
@@ -135,7 +63,6 @@ optimization:
       svm_gamma: [0.001, 1.0]  # log scale, only for rbf
   
   svr_optimization:
-    metric: "avg_coordinate_error"  # minimize this
     n_trials: 10
     parameter_ranges:
       svr_c: [0.001, 100.0]  # log scale
@@ -166,7 +93,3 @@ pipeline:
   cleanup:
     remove_temp_files: false  # Clean up temporary files after completion (set to false to keep checkpoints)
     keep_intermediate_results: true  # Keep intermediate results for inspection
-
-# Visualization Configuration
-visualization:
-  samples_per_stage: 3  # Number of sample visualizations per stage

@@ -18,99 +18,14 @@ class NonMaximumSuppression:
     and spatial proximity.
     """
     
-    def __init__(self, default_iou_threshold: float = 0.5, default_min_distance: float = 20.0):
+    def __init__(self, default_iou_threshold: float = 0.3):
         """
         Initialize NMS with default parameters.
         
         Args:
             default_iou_threshold: Default IoU threshold for suppression
-            default_min_distance: Default minimum distance between detections (pixels)
         """
         self.default_iou_threshold = default_iou_threshold
-        self.default_min_distance = default_min_distance
-    
-    def apply_nms(self, 
-                  detections: List[Tuple[float, float]], 
-                  offsets: Optional[List[Tuple[float, float]]] = None,
-                  iou_threshold: Optional[float] = None,
-                  min_distance: Optional[float] = None) -> List[Tuple[float, float]]:
-        """
-        Apply Non-Maximum Suppression using SVR offset magnitude.
-        
-        Strategy: Among nearby detections (within min_distance), keep the one
-        with smallest offset magnitude (most centered on the actual nurdle).
-        This leverages the SVR's predicted offset as a natural confidence metric.
-        
-        Args:
-            detections: List of (x, y) tuples
-            offsets: List of (offset_x, offset_y) tuples from SVR predictions
-            iou_threshold: IoU threshold (not used in offset-magnitude NMS)
-            min_distance: Minimum distance between detections (pixels)
-        
-        Returns:
-            Filtered detections
-        """
-        if not detections:
-            return []
-        
-        if min_distance is None:
-            min_distance = self.default_min_distance
-        
-        # If no offsets provided, fall back to simple processing order
-        if offsets is None or len(offsets) != len(detections):
-            keep = []
-            remaining = detections.copy()
-            
-            while remaining:
-                current = remaining.pop(0)
-                keep.append(current)
-                
-                filtered_remaining = []
-                for det in remaining:
-                    distance = self._calculate_distance(current, det)
-                    if distance > min_distance:
-                        filtered_remaining.append(det)
-                
-                remaining = filtered_remaining
-            
-            return keep
-        
-        # Offset-magnitude-based NMS with radius-based overlap
-        # Calculate offset magnitudes (distance from window center to predicted nurdle)
-        magnitudes = [np.sqrt(ox**2 + oy**2) for ox, oy in offsets]
-        
-        # Sort by offset magnitude (smallest = most centered on nurdle)
-        sorted_indices = np.argsort(magnitudes)
-        
-        kept_detections = []
-        kept_magnitudes = []
-        
-        # Use min_distance as the nurdle radius for overlap calculation
-        nurdle_radius = min_distance
-        
-        for idx in sorted_indices:
-            detection = detections[idx]
-            magnitude = magnitudes[idx]
-            
-            # Check if this detection's radius overlaps with any kept detection
-            is_duplicate = False
-            for kept_detection, kept_magnitude in zip(kept_detections, kept_magnitudes):
-                # Distance between detection centers
-                center_distance = self._calculate_distance(detection, kept_detection)
-                
-                # Two circles overlap if distance < sum of radii
-                # But since both detections represent the same nurdle size, use 2*radius
-                # Actually: overlap if center_distance < nurdle_radius (aggressive suppression)
-                # This means: if two predicted centers are within one radius, they're duplicates
-                if center_distance < nurdle_radius:
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                kept_detections.append(detection)
-                kept_magnitudes.append(magnitude)
-        
-        return kept_detections
     
     def apply_nms_with_boxes(self, 
                            detections: List[Tuple[float, float, float, float, float]], 

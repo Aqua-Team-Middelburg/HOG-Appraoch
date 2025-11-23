@@ -27,9 +27,12 @@ import logging
 import sys
 import shutil
 import cv2
+import json
+import zipfile
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+import numpy as np
 
 # Import pipeline components
 try:
@@ -53,12 +56,12 @@ class NurdlePipeline:
     """
     
     # Define available stages
-    AVAILABLE_STAGES = ['normalization', 'windows', 'features', 'tuning', 'training', 'evaluation']
+    AVAILABLE_STAGES = ['normalization', 'windows', 'features', 'tuning', 'training', 'evaluation', 'save']
     
     def __init__(self, config_path: str):
         """Initialize pipeline with configuration."""
         self.config_path = config_path
-        self.config = None
+        self.config = load_config(config_path)  # Load config on init
         self.logger = self._setup_logging()
         
         # Define checkpoint and output directories
@@ -87,19 +90,16 @@ class NurdlePipeline:
         
         self.logger.info("Modular pipeline initialized successfully")
     
-    def _get_feature_config(self) -> Dict[str, Any]:
-        """Get unified feature extractor configuration."""
-        return {
-            **self.config.windows,
-            **self.config.training,
-            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4])
-        }
-    
     def _load_checkpoints(self):
         """Load normalized data checkpoint and initialize feature extractor."""
         self.data_loader = DataLoader(self.config.data)
         self.data_loader.load_normalized_data(self.checkpoint_normalized)
-        self.feature_extractor = FeatureExtractor(self._get_feature_config())
+        feature_config = {
+            **self.config.windows,
+            **self.config.training,
+            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4])
+        }
+        self.feature_extractor = FeatureExtractor(feature_config)
     
     def _setup_logging(self):
         """Setup pipeline-specific logging."""
@@ -144,11 +144,6 @@ class NurdlePipeline:
                 old_log.unlink()
             except Exception:
                 pass  # Ignore errors during cleanup
-    
-    def _reload_config(self):
-        """Reload configuration from file."""
-        self.logger.debug(f"Reloading configuration from {self.config_path}")
-        self.config = load_config(self.config_path)
     
     def _create_stage_output_dir(self, stage: str):
         """Create and clear stage output directory."""
@@ -196,9 +191,6 @@ class NurdlePipeline:
                 if stage not in self.AVAILABLE_STAGES:
                     raise ValueError(f"Unknown stage: {stage}. Available: {self.AVAILABLE_STAGES}")
                 
-                # Reload config before each stage
-                self._reload_config()
-                
                 self.logger.info(f"\n{'='*80}")
                 self.logger.info(f"STAGE: {stage.upper()}")
                 self.logger.info(f"{'='*80}")
@@ -216,6 +208,8 @@ class NurdlePipeline:
                     results[stage] = self._run_training_stage()
                 elif stage == 'evaluation':
                     results[stage] = self._run_evaluation_stage()
+                elif stage == 'save':
+                    results[stage] = self._run_save_stage()
                 
                 self.logger.info(f"Stage '{stage}' completed successfully")
         
@@ -546,8 +540,8 @@ class NurdlePipeline:
         
         self.evaluator = ModelEvaluator(self.logger)
         nms_config = self.config._config.get('evaluation', {}).get('nms', {})
-        nms_distance = nms_config.get('distance_threshold', 20.0)
-        self.nms = NonMaximumSuppression(default_min_distance=nms_distance)
+        iou_threshold = nms_config.get('iou_threshold', 0.3)
+        self.nms = NonMaximumSuppression(default_iou_threshold=iou_threshold)
         
         # Create prediction engine
         prediction_engine = PredictionEngine(
@@ -562,24 +556,46 @@ class NurdlePipeline:
             count, detections = prediction_engine.predict_image_from_path(
                 image_path,
                 self.data_loader,
-                nms_distance
+                iou_threshold
             )
             return count, detections
         
-        # Run evaluation
+        # Log NMS configuration
+        self.logger.info(f"Using IoU-based NMS with threshold: {iou_threshold}")
+        
+        # Run detailed evaluation (SVM + SVR + Combined)
         self.logger.info(f"Evaluating on {len(self.data_loader.test_annotations)} test images...")
-        metrics = self.evaluator.evaluate_models(
+        detailed_results = self.evaluator.evaluate_models_detailed(
             test_annotations=self.data_loader.test_annotations,
-            predict_image_func=predict_image_with_nms
+            prediction_engine=prediction_engine,
+            data_loader=self.data_loader
         )
         
-        # Save evaluation results
-        self.logger.info("Saving evaluation results...")
+        # Save detailed evaluation results
+        self.logger.info("Saving detailed evaluation results...")
+        evaluations_dir = output_dir / 'evaluations'
+        evaluations_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save individual component results
+        with open(evaluations_dir / 'svm_only_results.json', 'w') as f:
+            json.dump(self._convert_to_serializable(detailed_results['svm_only']), f, indent=2)
+        
+        with open(evaluations_dir / 'svr_refinement_analysis.json', 'w') as f:
+            json.dump(self._convert_to_serializable(detailed_results['svr_refinement']), f, indent=2)
+        
+        with open(evaluations_dir / 'combined_results.json', 'w') as f:
+            json.dump(self._convert_to_serializable(detailed_results['combined']), f, indent=2)
+        
+        with open(evaluations_dir / 'detailed_evaluation_full.json', 'w') as f:
+            json.dump(self._convert_to_serializable(detailed_results), f, indent=2)
+        
+        # Use combined metrics for legacy compatibility
+        metrics = detailed_results['combined']
         self.evaluator.save_evaluation_results(metrics, str(output_dir))
         
-        # Generate evaluation report
-        self.logger.info("Generating evaluation report...")
-        report_path = self.evaluator.generate_evaluation_report(metrics, str(output_dir))
+        # Generate evaluation report (with detailed breakdown)
+        self.logger.info("Generating detailed evaluation report...")
+        report_path = self._generate_detailed_report(detailed_results, output_dir)
         
         # Generate visualizations
         self.logger.info("Generating evaluation visualizations...")
@@ -595,11 +611,137 @@ class NurdlePipeline:
         )
         
         return {
+            'detailed_results': detailed_results,
             'metrics': metrics,
             'report_path': report_path,
             'output_dir': str(output_dir),
             'visualizations_dir': str(viz_dir)
         }
+    
+    def _convert_to_serializable(self, obj):
+        """Convert numpy types to Python types for JSON serialization."""
+        if isinstance(obj, dict):
+            return {key: self._convert_to_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        else:
+            return obj
+    
+    def _generate_detailed_report(self, detailed_results: Dict[str, Any], output_dir: Path) -> str:
+        """Generate detailed evaluation report with component breakdown."""
+        evaluations_dir = output_dir / 'evaluations'
+        evaluations_dir.mkdir(parents=True, exist_ok=True)
+        report_path = evaluations_dir / 'evaluation_report_detailed.txt'
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("Nurdle Detection Pipeline - Detailed Evaluation Report\n")
+            f.write("=" * 70 + "\n\n")
+            
+            # SVM Only
+            f.write("[1] SVM CLASSIFIER DETECTION PERFORMANCE\n")
+            f.write("-" * 70 + "\n")
+            svm = detailed_results['svm_only']
+            f.write(f"  Classification Metrics:\n")
+            f.write(f"    Precision: {svm.get('precision', 0):.3f}\n")
+            f.write(f"    Recall: {svm.get('recall', 0):.3f}\n")
+            f.write(f"    F1-Score: {svm.get('f1_score', 0):.3f}\n")
+            f.write(f"  Detection Counts:\n")
+            f.write(f"    True Positives: {svm.get('true_positives', 0)}\n")
+            f.write(f"    False Positives: {svm.get('false_positives', 0)}\n")
+            f.write(f"    False Negatives: {svm.get('false_negatives', 0)}\n")
+            f.write(f"  NMS Filtering:\n")
+            f.write(f"    Before NMS: {svm.get('total_svm_positives', 0)} windows\n")
+            f.write(f"    After NMS: {svm.get('total_after_nms', 0)} windows\n")
+            f.write(f"    Reduction: {svm.get('total_svm_positives', 0) - svm.get('total_after_nms', 0)} windows\n")
+            f.write("\n")
+            
+            # SVR Contribution Analysis
+            f.write("[2] SVR COORDINATE REFINEMENT ANALYSIS\n")
+            f.write("-" * 70 + "\n")
+            svr = detailed_results['svr_refinement']
+            f.write(f"  EXPLANATION: This shows how much SVR moves predictions and whether\n")
+            f.write(f"  those movements improve or degrade coordinate accuracy.\n\n")
+            f.write(f"  Offset Statistics (how far SVR moves predictions):\n")
+            f.write(f"    Avg Offset Magnitude: {svr.get('avg_offset_magnitude', 0):.2f} pixels\n")
+            f.write(f"    Median Offset Magnitude: {svr.get('median_offset_magnitude', 0):.2f} pixels\n")
+            f.write(f"    Max Offset Magnitude: {svr.get('max_offset_magnitude', 0):.2f} pixels\n\n")
+            f.write(f"  Improvement Analysis (does SVR help or hurt?):\n")
+            f.write(f"    Avg Improvement: {svr.get('avg_improvement', 0):+.2f} pixels\n")
+            f.write(f"    Median Improvement: {svr.get('median_improvement', 0):+.2f} pixels\n")
+            total_preds = svr.get('total_predictions', 0)
+            pos_improve = svr.get('positive_improvements', 0)
+            neg_improve = svr.get('negative_improvements', 0)
+            if total_preds > 0:
+                pos_pct = 100*pos_improve/total_preds
+                neg_pct = 100*neg_improve/total_preds
+                f.write(f"    Predictions IMPROVED: {pos_improve} ({pos_pct:.1f}%)\n")
+                f.write(f"    Predictions DEGRADED: {neg_improve} ({neg_pct:.1f}%)\n")
+                f.write(f"    Total Predictions: {total_preds}\n")
+                if svr.get('avg_improvement', 0) < 0:
+                    f.write(f"\n  WARNING: SVR degrades coordinate accuracy on average!\n")
+                    f.write(f"  Consider retraining SVR or using SVM-only detections.\n")
+            else:
+                f.write(f"    No predictions to analyze.\n")
+            f.write("\n")
+            
+            # Combined
+            f.write("[3] COMBINED TWO-STAGE APPROACH (SVM + SVR)\n")
+            f.write("-" * 70 + "\n")
+            combined = detailed_results['combined']
+            f.write(f"  Detection Performance:\n")
+            f.write(f"    Precision: {combined.get('precision', 0):.3f}\n")
+            f.write(f"    Recall: {combined.get('recall', 0):.3f}\n")
+            f.write(f"    F1-Score: {combined.get('f1_score', 0):.3f}\n")
+            f.write(f"  Count Prediction:\n")
+            f.write(f"    MAE: {combined.get('count_mae', 0):.1f}\n")
+            f.write(f"    RMSE: {combined.get('count_rmse', 0):.1f}\n")
+            f.write(f"    Bias: {combined.get('count_bias', 0):.1f}\n")
+            f.write(f"  Coordinate Accuracy:\n")
+            f.write(f"    Avg Error: {combined.get('avg_coordinate_error', 0):.1f} pixels\n")
+            f.write(f"    Median Error: {combined.get('median_coordinate_error', 0):.1f} pixels\n")
+            f.write(f"    Max Error: {combined.get('max_coordinate_error', 0):.1f} pixels\n")
+            f.write(f"  Detection Counts:\n")
+            f.write(f"    True Positives: {combined.get('true_positives', 0)}\n")
+            f.write(f"    False Positives: {combined.get('false_positives', 0)}\n")
+            f.write(f"    False Negatives: {combined.get('false_negatives', 0)}\n")
+            f.write("\n")
+            
+            # Key Insights
+            f.write("[4] KEY INSIGHTS\n")
+            f.write("-" * 70 + "\n")
+            f1_change = combined.get('f1_score', 0) - svm.get('f1_score', 0)
+            precision_change = combined.get('precision', 0) - svm.get('precision', 0)
+            recall_change = combined.get('recall', 0) - svm.get('recall', 0)
+            
+            f.write(f"  Detection Performance Changes (SVM-only → Combined):\n")
+            f.write(f"    F1-Score Change: {f1_change:+.3f}\n")
+            f.write(f"    Precision Change: {precision_change:+.3f}\n")
+            f.write(f"    Recall Change: {recall_change:+.3f}\n\n")
+            
+            f.write(f"  Error Analysis:\n")
+            f.write(f"    SVM False Positives: {svm.get('false_positives', 0)}\n")
+            f.write(f"    Combined False Positives: {combined.get('false_positives', 0)}\n")
+            fp_reduction = svm.get('false_positives', 0) - combined.get('false_positives', 0)
+            f.write(f"    FP Reduction: {fp_reduction} ({100*fp_reduction/max(1,svm.get('false_positives',1)):.1f}%)\n\n")
+            
+            f.write(f"  Recommendations:\n")
+            if svr.get('avg_improvement', 0) < 0:
+                f.write(f"    [!] SVR is degrading performance - consider retraining or disabling\n")
+            if svm.get('recall', 0) < combined.get('recall', 0):
+                f.write(f"    [!] Combined approach has lower recall - SVR may be over-filtering\n")
+            if f1_change > 0.05:
+                f.write(f"    [+] SVR provides significant F1 improvement - keep using two-stage\n")
+            elif abs(f1_change) < 0.02:
+                f.write(f"    [~] Minimal F1 change - evaluate if SVR complexity is worth it\n")
+            
+            f.write("\n" + "=" * 70 + "\n")
+        
+        self.logger.info(f"Generated detailed evaluation report: {report_path}")
+        return str(report_path)
     
     def clean_temp(self):
         """Clean temporary checkpoint files."""
@@ -608,6 +750,60 @@ class NurdlePipeline:
             shutil.rmtree(self.temp_dir)
             self.logger.info(f"Removed {self.temp_dir}")
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _run_save_stage(self) -> Dict[str, Any]:
+        """Stage 7: Save a zipped copy of the output folder to configured save directory.
+        
+        Prerequisites:
+        - output/ directory must exist with pipeline results
+        
+        Outputs:
+        - Zipped copy of output folder in save_dir
+        
+        Returns:
+            Dictionary with zip file path
+        """
+        save_dir = self.config.data.get('save_dir')
+        
+        if not save_dir:
+            raise ValueError("ERROR: Save - No save_dir configured in config.yaml. Set data.save_dir to enable saving.")
+        
+        # Check if output directory exists
+        output_dir = Path('output')
+        if not output_dir.exists():
+            raise FileNotFoundError(f"ERROR: Save - Output directory not found: {output_dir}. Run pipeline stages first.")
+        
+        # Create save directory if it doesn't exist
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create zip filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        zip_filename = f"output_{timestamp}.zip"
+        zip_path = save_path / zip_filename
+        
+        self.logger.info(f"Creating zip archive of output folder...")
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Walk through output directory and add all files
+            file_count = 0
+            for file_path in output_dir.rglob('*'):
+                if file_path.is_file():
+                    # Calculate relative path for archive
+                    arcname = file_path.relative_to(output_dir.parent)
+                    zipf.write(file_path, arcname)
+                    self.logger.debug(f"Added to zip: {arcname}")
+                    file_count += 1
+        
+        zip_size_mb = zip_path.stat().st_size / (1024*1024)
+        self.logger.info(f"Output folder saved to: {zip_path}")
+        self.logger.info(f"Archived {file_count} files, zip size: {zip_size_mb:.2f} MB")
+        
+        return {
+            'zip_path': str(zip_path),
+            'zip_size_mb': round(zip_size_mb, 2),
+            'files_archived': file_count
+        }
 
 
 def setup_logging():
@@ -636,7 +832,7 @@ def parse_arguments():
         '--steps',
         type=str,
         default=None,
-        help='Comma-separated list of stages to run (default: all stages in order). Options: normalization,windows,features,tuning,training,evaluation'
+        help='Comma-separated list of stages to run (default: all stages except save). Options: normalization,windows,features,tuning,training,evaluation,save'
     )
     
     parser.add_argument(
@@ -677,9 +873,9 @@ def main():
         
         # Parse and validate steps
         if not args.steps:
-            # Default to all stages in order
-            steps = NurdlePipeline.AVAILABLE_STAGES.copy()
-            print(f"No steps specified, running all stages: {', '.join(steps)}")
+            # Default to all stages except save
+            steps = [s for s in NurdlePipeline.AVAILABLE_STAGES if s != 'save']
+            print(f"No steps specified, running default stages: {', '.join(steps)}")
         else:
             steps = [s.strip() for s in args.steps.split(',')]
         
@@ -693,7 +889,7 @@ def main():
         # Run pipeline
         results = pipeline.run(steps)
         
-        print("\n" + "=" * 80)
+        print("=" * 80)
         print("PIPELINE EXECUTION SUMMARY")
         print("=" * 80)
         for stage, result in results.items():
