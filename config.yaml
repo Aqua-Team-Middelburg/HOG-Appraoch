@@ -18,38 +18,18 @@ data:
   output_dir: "output"            # Output directory for results
   save_dir: "saved_outputs"       # Directory to save zipped output folders (set to null to disable)
 
-# Window Processing Configuration
-windows:
-  size: [20, 20]                  # Window size [width, height]
-  stride: 18                      # Sliding window stride
-
 # Feature Extraction Configuration  
 features:
-  hog_cell_size: [4, 4]           # HOG cell size
+  hog_cell_size: [5, 5]           # HOG cell size
+  image_size: [1080, 1080]        # Resize images to this size before feature extraction
 
 # Training Configuration
-training:
-  negative_positive_ratio: 3.0    # Ratio of negative to positive samples (3:1)
-  min_distance_from_nurdles: 25   # Minimum pixel distance for negative sample selection
-  nurdle_radius: 10               # Expected nurdle radius in pixels (for window labeling)
-                                  # A window is positive if its center is within this radius
-                                  # of any nurdle center point
+training: {}
 
 # Evaluation Configuration  
 evaluation:
   # Test set configuration
   test_split_ratio: 0.2  # Portion of data reserved for testing
-  
-  # NMS Configuration
-  nms:
-    iou_threshold: 0.1  # IoU threshold for Non-Maximum Suppression (default: 0.1)
-    # NMS Strategy: IoU-based after SVM classification
-    # Applied to positive SVM windows before SVR processing.
-    # Reduces redundant overlapping windows based on SVM confidence scores.
-    # SVR only processes windows that pass NMS filtering.
-    # Note: With stride=15 and window_size=20, adjacent windows have IoU ~0.11
-    # Set threshold to 0.1 to filter overlapping windows while keeping distinct detections
-  
   # Per-model evaluation
   per_model: true  # Enable separate evaluation for each model type
   
@@ -61,14 +41,6 @@ optimization:
       svm_c: [0.001, 100.0]  # log scale
       svm_kernel: ["linear", "rbf"]
       svm_gamma: [0.001, 1.0]  # log scale, only for rbf
-  
-  svr_optimization:
-    n_trials: 10
-    parameter_ranges:
-      svr_c: [0.001, 100.0]  # log scale
-      svr_kernel: ["linear", "rbf"]
-      svr_gamma: [0.001, 1.0]  # log scale, only for rbf
-      svr_epsilon: [0.01, 1.0]  # regression tolerance
     
 # Pipeline Control
 pipeline:

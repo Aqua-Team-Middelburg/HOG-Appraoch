@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-"""
-Nurdle Detection Pipeline - Modular Step-by-Step Execution
-==========================================================
-
-Modular pipeline with checkpoint-based stages and intermediate outputs.
-
-Features:
-- Step-by-step execution via --steps flag
-- Checkpoint save/load for normalized data and windows
-- Intermediate visualizations for each stage
-- Progress tracking with tqdm
-- Enhanced error checking and logging
-
-Usage:
-    python pipeline.py --steps normalization,windows,features,tuning,training,evaluation
-    python pipeline.py --steps normalization              # Run only normalization
-    python pipeline.py --steps training,evaluation        # Skip to training if checkpoints exist
-    python pipeline.py --clean-temp                       # Clean temporary files
-
-Author: Aqua Team Middelburg  
-Version: 3.0.0 (Modular Pipeline)
-"""
-
 import argparse
 import logging
 import sys
@@ -33,6 +9,8 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 import numpy as np
+import os
+import threading
 
 # Import pipeline components
 try:
@@ -56,7 +34,7 @@ class NurdlePipeline:
     """
     
     # Define available stages
-    AVAILABLE_STAGES = ['normalization', 'windows', 'features', 'tuning', 'training', 'evaluation', 'save']
+    AVAILABLE_STAGES = ['normalization', 'features', 'tuning', 'training', 'evaluation', 'save']
     
     def __init__(self, config_path: str):
         """Initialize pipeline with configuration."""
@@ -67,16 +45,13 @@ class NurdlePipeline:
         # Define checkpoint and output directories
         self.temp_dir = Path('temp')
         self.checkpoint_normalized = self.temp_dir / 'normalized'
-        self.checkpoint_windows = self.temp_dir / 'candidate_windows'
-        
         # Stage output directories
         self.output_dirs = {
             'normalization': Path('output/01_normalization'),
-            'windows': Path('output/02_windows'),
-            'features': Path('output/03_features'),
-            'tuning': Path('output/04_tuning'),
-            'training': Path('output/05_training'),
-            'evaluation': Path('output/06_evaluation')
+            'features': Path('output/02_features'),
+            'tuning': Path('output/03_tuning'),
+            'training': Path('output/04_training'),
+            'evaluation': Path('output/05_evaluation')
         }
         
         # Models directory
@@ -90,16 +65,7 @@ class NurdlePipeline:
         
         self.logger.info("Modular pipeline initialized successfully")
     
-    def _load_checkpoints(self):
-        """Load normalized data checkpoint and initialize feature extractor."""
-        self.data_loader = DataLoader(self.config.data)
-        self.data_loader.load_normalized_data(self.checkpoint_normalized)
-        feature_config = {
-            **self.config.windows,
-            **self.config.training,
-            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4])
-        }
-        self.feature_extractor = FeatureExtractor(feature_config)
+    # Remove _load_checkpoints (legacy, not used in single-stage pipeline)
     
     def _setup_logging(self):
         """Setup pipeline-specific logging."""
@@ -165,18 +131,17 @@ class NurdlePipeline:
     def run(self, steps: List[str]) -> Dict[str, Any]:
         """
         Run specified pipeline stages with checkpoint-based execution.
-        
+
         Available stages:
         - normalization: Load and normalize images, save checkpoints
-        - windows: Generate candidate windows, save checkpoints  
-        - features: Extract and visualize features (no saving)
-        - tuning: Hyperparameter optimization with Optuna
-        - training: Train models and save metrics
-        - evaluation: Comprehensive evaluation with all metrics
-        
+        - features: Extract and visualize features
+        - training: Train SVM count classifier and save metrics
+        - evaluation: Evaluate count prediction accuracy
+        - save: Zip output folder
+
         Args:
             steps: List of stage names to execute
-            
+
         Returns:
             Dictionary with results from executed stages
         """
@@ -186,20 +151,17 @@ class NurdlePipeline:
         
         results = {}
         
+        last_stage = None
         try:
             for stage in steps:
                 if stage not in self.AVAILABLE_STAGES:
                     raise ValueError(f"Unknown stage: {stage}. Available: {self.AVAILABLE_STAGES}")
-                
                 self.logger.info(f"\n{'='*80}")
                 self.logger.info(f"STAGE: {stage.upper()}")
                 self.logger.info(f"{'='*80}")
-                
                 # Execute stage
                 if stage == 'normalization':
                     results[stage] = self._run_normalization_stage()
-                elif stage == 'windows':
-                    results[stage] = self._run_windows_stage()
                 elif stage == 'features':
                     results[stage] = self._run_features_stage()
                 elif stage == 'tuning':
@@ -210,11 +172,11 @@ class NurdlePipeline:
                     results[stage] = self._run_evaluation_stage()
                 elif stage == 'save':
                     results[stage] = self._run_save_stage()
-                
                 self.logger.info(f"Stage '{stage}' completed successfully")
-        
+                last_stage = stage
         except Exception as e:
-            self.logger.error(f"Pipeline failed at stage '{stage}': {e}", exc_info=True)
+            stage_name = last_stage if last_stage is not None else 'unknown'
+            self.logger.error(f"Pipeline failed at stage '{stage_name}': {e}", exc_info=True)
             raise
         
         self.logger.info("=" * 80)
@@ -264,240 +226,110 @@ class NurdlePipeline:
             'checkpoint': str(self.checkpoint_normalized)
         }
     
-    def _run_windows_stage(self) -> Dict[str, Any]:
-        """
-        Stage 2: Generate candidate windows and save checkpoints.
-        
-        Prerequisites:
-        - temp/normalized/ must exist
-        
-        Outputs:
-        - temp/candidate_windows/ - Checkpoint with window metadata
-        - output/02_windows/ - Sample window visualizations
-        """
-        # Check prerequisites
-        if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Windows', 'normalization'):
-            raise FileNotFoundError(f"ERROR: Windows - Normalized data not found. Run --steps normalization first.")
-        
-        output_dir = self._create_stage_output_dir('windows')
-        
-        # Load checkpoints
-        self.logger.info("Loading checkpoints...")
-        self._load_checkpoints()
-        
-        # Generate windows for all training images
-        self.logger.info("Generating candidate windows...")
-        all_windows = []
-        
-        for annotation in tqdm(self.data_loader.train_annotations, desc="Processing images"):
-            image = self.data_loader.load_image(annotation.image_path)
-            windows = self.feature_extractor.generate_windows_for_image(image, annotation)
-            all_windows.extend(windows)
-        
-        # Save windows checkpoint (implemented in step 3)
-        self.logger.info("Saving windows checkpoint...")
-        self.feature_extractor.save_windows(all_windows, self.checkpoint_windows)
-        
-        # Generate sample visualizations
-        self.logger.info("Generating window visualizations...")
-        self.feature_extractor.visualize_windows_samples(
-            all_windows, self.data_loader, output_dir, num_samples=3
-        )
-        
-        return {
-            'total_windows': len(all_windows),
-            'checkpoint': str(self.checkpoint_windows)
-        }
-    
     def _run_features_stage(self) -> Dict[str, Any]:
         """
-        Stage 3: Extract and visualize features.
-        
+        Stage 2: Extract and visualize features.
+
         Prerequisites:
         - temp/normalized/ must exist
-        - temp/candidate_windows/ must exist
-        
+
         Outputs:
         - output/03_features/ - Feature visualizations (HOG overlays, LBP patterns)
-        
+
         Note: Features are NOT saved, training uses generator.
         """
-        # Check prerequisites
         if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Features', 'normalization'):
             raise FileNotFoundError(f"ERROR: Features - Normalized data not found. Run --steps normalization first.")
-        if not self._check_checkpoint_exists(self.checkpoint_windows, 'Features', 'windows'):
-            raise FileNotFoundError(f"ERROR: Features - Window data not found. Run --steps windows first.")
-        
         output_dir = self._create_stage_output_dir('features')
-        
-        # Load checkpoints
-        self.logger.info("Loading checkpoints...")
-        self._load_checkpoints()
-        
-        # Generate feature visualizations
-        self.logger.info("Generating feature visualizations...")
-        windows = self.feature_extractor.load_windows(self.checkpoint_windows)
-        self.feature_extractor.visualize_features(windows, self.data_loader, output_dir)
-        
-        return {
-            'visualization_dir': str(output_dir)
+        self.logger.info("Extracting features for all images...")
+        self.data_loader = DataLoader(self.config.data)
+        self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        feature_config = {
+            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
+            'image_size': self.config.features.get('image_size', [1080, 1080])
         }
+        self.feature_extractor = FeatureExtractor(feature_config)
+        # Visualize feature samples for up to 3 test images
+        self.feature_extractor.visualize_feature_samples(
+            self.data_loader.test_annotations,
+            self.data_loader.load_image,
+            str(output_dir),
+            num_samples=3
+        )
+        return {'visualization_dir': str(output_dir)}
     
     def _run_tuning_stage(self) -> Dict[str, Any]:
         """
-        Stage 4: Hyperparameter optimization with Optuna.
-        
+        Stage 3: Hyperparameter tuning for SVR regressor.
+
         Prerequisites:
         - temp/normalized/ must exist
-        - temp/candidate_windows/ must exist
-        
+
         Outputs:
-        - output/04_tuning/svm/ - SVM optimization results
-        - output/04_tuning/svr/ - SVR optimization results
+        - output/03_tuning/ - Tuning results and best parameters
         """
-        # Check prerequisites
+        from src.optuna import OptunaTuner
         if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Tuning', 'normalization'):
             raise FileNotFoundError(f"ERROR: Tuning - Normalized data not found. Run --steps normalization first.")
-        if not self._check_checkpoint_exists(self.checkpoint_windows, 'Tuning', 'windows'):
-            raise FileNotFoundError(f"ERROR: Tuning - Window data not found. Run --steps windows first.")
-        
         output_dir = self._create_stage_output_dir('tuning')
-        
-        # Load checkpoints
-        self.logger.info("Loading checkpoints...")
+        self.logger.info("Loading normalized data for tuning...")
         self.data_loader = DataLoader(self.config.data)
         self.data_loader.load_normalized_data(self.checkpoint_normalized)
-        
         feature_config = {
-            **self.config.windows,
-            **self.config.training,
-            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4])
+            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
+            'image_size': self.config.features.get('image_size', [1080, 1080])
         }
         self.feature_extractor = FeatureExtractor(feature_config)
-        
-        # Run Optuna optimization with sequential strategy (SVM then SVR)
-        self.logger.info("Running hyperparameter optimization...")
-        from src.optuna import OptunaTuner
-        
-        # Create training function for Optuna
-        def train_and_evaluate(params: dict) -> dict:
-            """Train models with given parameters and return metrics."""
-            # Temporarily suppress verbose logging during trials
-            import logging
-            prev_levels = {}
-            for logger_name in ['src.features.feature_extractor', 'src.models.model_trainer']:
-                logger = logging.getLogger(logger_name)
-                prev_levels[logger_name] = logger.level
-                logger.setLevel(logging.WARNING)
-            
-            try:
-                # Create trial config
-                trial_config = self.config._config.copy()
-                
-                # Update model parameters
-                if 'model' not in trial_config:
-                    trial_config['model'] = {}
-                trial_config['model'].update(params)
-                
-                # Create model trainer with trial config
-                from src.models import ModelTrainer
-                trial_trainer = ModelTrainer(trial_config)
-                
-                # Train models
-                window_batches = self.feature_extractor.generate_training_windows_batch(
-                    self.data_loader.train_annotations,
-                    self.data_loader.load_image
-                )
-                training_metrics = trial_trainer.train_models(window_batches)
-                
-                # Return actual metrics from training
-                return {
-                    'f1_score': training_metrics['svm']['f1_score'],
-                    'avg_coordinate_error': training_metrics['svr']['mean_error']
-                }
-            finally:
-                # Restore logging levels
-                for logger_name, level in prev_levels.items():
-                    logging.getLogger(logger_name).setLevel(level)
-        
-        # Initialize tuner
-        optuna_config = self.config._config.get('optimization', {})
-        tuner = OptunaTuner(optuna_config, self.logger)
-        
-        # Run sequential optimization
-        best_params = tuner.optimize_sequential(train_and_evaluate, str(output_dir))
-        
+        training_data = list(self.feature_extractor.generate_training_data(
+            self.data_loader.train_annotations, self.data_loader.load_image))
+        config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
+        tuner = OptunaTuner(config_dict)
+        def trainer_func(params):
+            trainer = ModelTrainer({**config_dict, **params})
+            return trainer.train_count_regressor(training_data)
+        tuning_results = tuner.optimize(trainer_func, str(output_dir))
+        best_params = tuning_results.get('best_params', {})
         return {
             'best_params': best_params,
-            'output_dir': str(output_dir)
+            'best_mae': tuning_results.get('best_value'),
+            'n_trials': tuning_results.get('n_trials'),
+            'output_dir': str(output_dir),
+            'tuning_results_path': str(output_dir / 'tuning_results.json'),
         }
     
     def _run_training_stage(self) -> Dict[str, Any]:
         """
-        Stage 5: Train models and collect metrics.
-        
+        Stage 3: Train SVR regressor and collect metrics.
+
         Prerequisites:
         - temp/normalized/ must exist
-        - temp/candidate_windows/ must exist
-        
+
         Outputs:
-        - output/05_training/{model_name}/ - Training metrics and curves
+        - output/04_training/ - Training metrics and curves
         - output/models/ - Saved models
         """
-        # Check prerequisites
         if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Training', 'normalization'):
             raise FileNotFoundError(f"ERROR: Training - Normalized data not found. Run --steps normalization first.")
-        if not self._check_checkpoint_exists(self.checkpoint_windows, 'Training', 'windows'):
-            raise FileNotFoundError(f"ERROR: Training - Window data not found. Run --steps windows first.")
-        
         output_dir = self._create_stage_output_dir('training')
-        
-        # Load checkpoints
-        self.logger.info("Loading checkpoints...")
+        self.logger.info("Loading normalized data for training...")
         self.data_loader = DataLoader(self.config.data)
         self.data_loader.load_normalized_data(self.checkpoint_normalized)
-        
         feature_config = {
-            **self.config.windows,
-            **self.config.training,
-            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4])
+            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
+            'image_size': self.config.features.get('image_size', [1080, 1080])
         }
         self.feature_extractor = FeatureExtractor(feature_config)
-        
-        # Load tuning results if available
-        tuning_dir = self.output_dirs.get('tuning')
-        # Initialize model trainer
-        training_config = self.config._config.copy()
-        self.model_trainer = ModelTrainer(training_config)
-        
-        # Load optimized hyperparameters if available
-        best_params = self.model_trainer.load_tuning_results(tuning_dir) if tuning_dir and tuning_dir.exists() else {}
-        
-        if best_params:
-            if 'model' not in training_config:
-                training_config['model'] = {}
-            training_config['model'].update(best_params)
-            # Reinitialize trainer with updated config
-            self.model_trainer = ModelTrainer(training_config)
-        
-        # Train models with metrics collection (implemented in step 6)
-        self.logger.info("Training models...")
-        window_batches = self.feature_extractor.generate_training_windows_batch(
-            self.data_loader.train_annotations,
-            self.data_loader.load_image
-        )
-        
-        training_metrics = self.model_trainer.train_models(window_batches)
-        
-        # Save models
-        self.logger.info("Saving models...")
+        training_data = list(self.feature_extractor.generate_training_data(
+            self.data_loader.train_annotations, self.data_loader.load_image))
+        config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
+        self.model_trainer = ModelTrainer(config_dict)
+        training_metrics = self.model_trainer.train_count_regressor(training_data)
         self.models_dir.mkdir(parents=True, exist_ok=True)
-        self.model_trainer.save_models(str(self.models_dir))
-        
-        # Save training metrics
-        self.logger.info("Saving training metrics...")
-        self.model_trainer.save_training_metrics(training_metrics, str(output_dir))
-        
+        self.model_trainer.save_model(str(self.models_dir))
+        metrics_path = output_dir / 'training_metrics.json'
+        # Always overwrite to ensure metrics are present
+        with open(metrics_path, 'w') as f:
+            json.dump(training_metrics, f, indent=2)
         return {
             'training_metrics': training_metrics,
             'models_dir': str(self.models_dir),
@@ -506,242 +338,97 @@ class NurdlePipeline:
     
     def _run_evaluation_stage(self) -> Dict[str, Any]:
         """
-        Stage 6: Comprehensive evaluation of trained models.
-        
+        Stage 4: Evaluate trained SVR regressor and generate visualizations.
+
         Prerequisites:
         - temp/normalized/ must exist
         - output/models/ must have trained models
-        
+
         Outputs:
-        - output/06_evaluation/ - Evaluation metrics, visualizations, and report
+        - output/05_evaluation/ - Evaluation metrics, report, and visualizations
         """
-        # Check prerequisites
         if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Evaluation', 'normalization'):
             raise FileNotFoundError(f"ERROR: Evaluation - Normalized data not found. Run --steps normalization first.")
-        
         if not self.models_dir.exists() or not any(self.models_dir.glob('*.pkl')):
             raise FileNotFoundError(f"ERROR: Evaluation - No trained models found in {self.models_dir}. Run --steps training first.")
-        
         output_dir = self._create_stage_output_dir('evaluation')
-        
-        # Load test data
-        self.logger.info("Loading test data...")
-        self._load_checkpoints()
-        self.model_trainer = ModelTrainer(self.config._config)
-        
-        # Load trained models
-        self.logger.info(f"Loading models from {self.models_dir}...")
-        self.model_trainer.load_models(str(self.models_dir))
-        
-        # Initialize evaluator, NMS, and prediction engine
-        from src.evaluation.evaluator import ModelEvaluator
-        from src.evaluation.nms import NonMaximumSuppression
-        from src.models import PredictionEngine
-        
-        self.evaluator = ModelEvaluator(self.logger)
-        nms_config = self.config._config.get('evaluation', {}).get('nms', {})
-        iou_threshold = nms_config.get('iou_threshold', 0.3)
-        self.nms = NonMaximumSuppression(default_iou_threshold=iou_threshold)
-        
-        # Create prediction engine
-        prediction_engine = PredictionEngine(
-            self.feature_extractor,
-            self.model_trainer,
-            self.nms
-        )
-        
-        # Create prediction function
-        def predict_image_with_nms(image_path: str):
-            """Predict nurdles for an image using prediction engine."""
-            count, detections = prediction_engine.predict_image_from_path(
-                image_path,
-                self.data_loader,
-                iou_threshold
-            )
-            return count, detections
-        
-        # Log NMS configuration
-        self.logger.info(f"Using IoU-based NMS with threshold: {iou_threshold}")
-        
-        # Run detailed evaluation (SVM + SVR + Combined)
-        self.logger.info(f"Evaluating on {len(self.data_loader.test_annotations)} test images...")
-        detailed_results = self.evaluator.evaluate_models_detailed(
-            test_annotations=self.data_loader.test_annotations,
-            prediction_engine=prediction_engine,
-            data_loader=self.data_loader
-        )
-        
-        # Save detailed evaluation results
-        self.logger.info("Saving detailed evaluation results...")
-        evaluations_dir = output_dir / 'evaluations'
-        evaluations_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save individual component results
-        with open(evaluations_dir / 'svm_only_results.json', 'w') as f:
-            json.dump(self._convert_to_serializable(detailed_results['svm_only']), f, indent=2)
-        
-        with open(evaluations_dir / 'svr_refinement_analysis.json', 'w') as f:
-            json.dump(self._convert_to_serializable(detailed_results['svr_refinement']), f, indent=2)
-        
-        with open(evaluations_dir / 'combined_results.json', 'w') as f:
-            json.dump(self._convert_to_serializable(detailed_results['combined']), f, indent=2)
-        
-        with open(evaluations_dir / 'detailed_evaluation_full.json', 'w') as f:
-            json.dump(self._convert_to_serializable(detailed_results), f, indent=2)
-        
-        # Use combined metrics for legacy compatibility
-        metrics = detailed_results['combined']
-        self.evaluator.save_evaluation_results(metrics, str(output_dir))
-        
-        # Generate evaluation report (with detailed breakdown)
-        self.logger.info("Generating detailed evaluation report...")
-        report_path = self._generate_detailed_report(detailed_results, output_dir)
-        
-        # Generate visualizations
-        self.logger.info("Generating evaluation visualizations...")
-        viz_dir = output_dir / 'visualizations'
-        viz_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.evaluator.generate_evaluation_visualizations(
-            test_annotations=self.data_loader.test_annotations,
-            predict_image_func=predict_image_with_nms,
-            data_loader=self.data_loader,
-            metrics=metrics,
-            output_dir=str(viz_dir)
-        )
-        
+        self.logger.info("Loading normalized data for evaluation...")
+        self.data_loader = DataLoader(self.config.data)
+        self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        feature_config = {
+            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
+            'image_size': self.config.features.get('image_size', [1080, 1080])
+        }
+        feature_extractor = FeatureExtractor(feature_config)
+        model_trainer = ModelTrainer(self.config if isinstance(self.config, dict) else vars(self.config))
+        model_trainer.load_model(str(self.models_dir))
+        self.evaluator = ModelEvaluator()
+        test_annots = self.data_loader.test_annotations
+        y_true = []
+        y_pred = []
+        for annot in test_annots:
+            image = self.data_loader.load_image(annot.image_path)
+            features = feature_extractor.extract_image_features(image)
+            pred_count = model_trainer.predict_count(features)
+            y_true.append(annot.nurdle_count)
+            y_pred.append(pred_count)
+        from sklearn.metrics import mean_absolute_error, mean_squared_error
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mape = np.mean(np.abs((np.array(y_true) - np.array(y_pred)) / np.maximum(np.array(y_true), 1))) * 100
+        eval_metrics = {
+            'mae': float(mae),
+            'rmse': float(rmse),
+            'mape': float(mape),
+            'n_test': len(y_true)
+        }
+        with open(output_dir / 'evaluation_metrics.json', 'w') as f:
+            json.dump(eval_metrics, f, indent=2)
+        import matplotlib.pyplot as plt
+        training_output_dir = self.output_dirs['training']
+        training_metrics_path = training_output_dir / 'training_metrics.json'
+        if training_metrics_path.exists():
+            with open(training_metrics_path, 'r') as f:
+                training_metrics = json.load(f)
+        else:
+            training_metrics = None
+            self.logger.warning(f"Training metrics not found at {training_metrics_path}; skipping train/test comparison plot")
+        if training_metrics:
+            metrics_names = ['MAE', 'RMSE', 'MAPE']
+            train_vals = [
+                training_metrics.get('mae', 0),
+                training_metrics.get('rmse', 0),
+                training_metrics.get('mape', 0)
+            ]
+            test_vals = [eval_metrics['mae'], eval_metrics['rmse'], eval_metrics['mape']]
+            x = np.arange(len(metrics_names))
+            plt.figure(figsize=(7, 5))
+            plt.bar(x - 0.2, train_vals, width=0.4, label='Train')
+            plt.bar(x + 0.2, test_vals, width=0.4, label='Test')
+            plt.xticks(x, metrics_names)
+            plt.ylabel('Metric Value')
+            plt.title('Training vs Testing Metrics')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(output_dir / 'train_vs_test_metrics.png')
+            plt.close()
+        # Individual test image visualizations
+        for ann, pred_count in zip(test_annots, y_pred):
+            img = self.data_loader.load_image(ann.image_path)
+            actual_count = ann.nurdle_count
+            plt.figure(figsize=(6, 6))
+            plt.imshow(img, cmap='gray')
+            plt.title(f"Actual: {actual_count} | Predicted: {pred_count:.1f}")
+            plt.axis('off')
+            out_path = output_dir / f"{ann.image_id}_eval.png"
+            plt.savefig(out_path, bbox_inches='tight')
+            plt.close()
         return {
-            'detailed_results': detailed_results,
-            'metrics': metrics,
-            'report_path': report_path,
-            'output_dir': str(output_dir),
-            'visualizations_dir': str(viz_dir)
+            'evaluation_metrics': eval_metrics,
+            'visualization_dir': str(output_dir)
         }
     
-    def _convert_to_serializable(self, obj):
-        """Convert numpy types to Python types for JSON serialization."""
-        if isinstance(obj, dict):
-            return {key: self._convert_to_serializable(value) for key, value in obj.items()}
-        elif isinstance(obj, list):
-            return [self._convert_to_serializable(item) for item in obj]
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, (np.integer, np.floating)):
-            return float(obj)
-        else:
-            return obj
-    
-    def _generate_detailed_report(self, detailed_results: Dict[str, Any], output_dir: Path) -> str:
-        """Generate detailed evaluation report with component breakdown."""
-        evaluations_dir = output_dir / 'evaluations'
-        evaluations_dir.mkdir(parents=True, exist_ok=True)
-        report_path = evaluations_dir / 'evaluation_report_detailed.txt'
-        
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("Nurdle Detection Pipeline - Detailed Evaluation Report\n")
-            f.write("=" * 70 + "\n\n")
-            
-            # SVM Only
-            f.write("[1] SVM CLASSIFIER DETECTION PERFORMANCE\n")
-            f.write("-" * 70 + "\n")
-            svm = detailed_results['svm_only']
-            f.write(f"  Classification Metrics:\n")
-            f.write(f"    Precision: {svm.get('precision', 0):.3f}\n")
-            f.write(f"    Recall: {svm.get('recall', 0):.3f}\n")
-            f.write(f"    F1-Score: {svm.get('f1_score', 0):.3f}\n")
-            f.write(f"  Detection Counts:\n")
-            f.write(f"    True Positives: {svm.get('true_positives', 0)}\n")
-            f.write(f"    False Positives: {svm.get('false_positives', 0)}\n")
-            f.write(f"    False Negatives: {svm.get('false_negatives', 0)}\n")
-            f.write(f"  NMS Filtering:\n")
-            f.write(f"    Before NMS: {svm.get('total_svm_positives', 0)} windows\n")
-            f.write(f"    After NMS: {svm.get('total_after_nms', 0)} windows\n")
-            f.write(f"    Reduction: {svm.get('total_svm_positives', 0) - svm.get('total_after_nms', 0)} windows\n")
-            f.write("\n")
-            
-            # SVR Contribution Analysis
-            f.write("[2] SVR COORDINATE REFINEMENT ANALYSIS\n")
-            f.write("-" * 70 + "\n")
-            svr = detailed_results['svr_refinement']
-            f.write(f"  EXPLANATION: This shows how much SVR moves predictions and whether\n")
-            f.write(f"  those movements improve or degrade coordinate accuracy.\n\n")
-            f.write(f"  Offset Statistics (how far SVR moves predictions):\n")
-            f.write(f"    Avg Offset Magnitude: {svr.get('avg_offset_magnitude', 0):.2f} pixels\n")
-            f.write(f"    Median Offset Magnitude: {svr.get('median_offset_magnitude', 0):.2f} pixels\n")
-            f.write(f"    Max Offset Magnitude: {svr.get('max_offset_magnitude', 0):.2f} pixels\n\n")
-            f.write(f"  Improvement Analysis (does SVR help or hurt?):\n")
-            f.write(f"    Avg Improvement: {svr.get('avg_improvement', 0):+.2f} pixels\n")
-            f.write(f"    Median Improvement: {svr.get('median_improvement', 0):+.2f} pixels\n")
-            total_preds = svr.get('total_predictions', 0)
-            pos_improve = svr.get('positive_improvements', 0)
-            neg_improve = svr.get('negative_improvements', 0)
-            if total_preds > 0:
-                pos_pct = 100*pos_improve/total_preds
-                neg_pct = 100*neg_improve/total_preds
-                f.write(f"    Predictions IMPROVED: {pos_improve} ({pos_pct:.1f}%)\n")
-                f.write(f"    Predictions DEGRADED: {neg_improve} ({neg_pct:.1f}%)\n")
-                f.write(f"    Total Predictions: {total_preds}\n")
-                if svr.get('avg_improvement', 0) < 0:
-                    f.write(f"\n  WARNING: SVR degrades coordinate accuracy on average!\n")
-                    f.write(f"  Consider retraining SVR or using SVM-only detections.\n")
-            else:
-                f.write(f"    No predictions to analyze.\n")
-            f.write("\n")
-            
-            # Combined
-            f.write("[3] COMBINED TWO-STAGE APPROACH (SVM + SVR)\n")
-            f.write("-" * 70 + "\n")
-            combined = detailed_results['combined']
-            f.write(f"  Detection Performance:\n")
-            f.write(f"    Precision: {combined.get('precision', 0):.3f}\n")
-            f.write(f"    Recall: {combined.get('recall', 0):.3f}\n")
-            f.write(f"    F1-Score: {combined.get('f1_score', 0):.3f}\n")
-            f.write(f"  Count Prediction:\n")
-            f.write(f"    MAE: {combined.get('count_mae', 0):.1f}\n")
-            f.write(f"    RMSE: {combined.get('count_rmse', 0):.1f}\n")
-            f.write(f"    Bias: {combined.get('count_bias', 0):.1f}\n")
-            f.write(f"  Coordinate Accuracy:\n")
-            f.write(f"    Avg Error: {combined.get('avg_coordinate_error', 0):.1f} pixels\n")
-            f.write(f"    Median Error: {combined.get('median_coordinate_error', 0):.1f} pixels\n")
-            f.write(f"    Max Error: {combined.get('max_coordinate_error', 0):.1f} pixels\n")
-            f.write(f"  Detection Counts:\n")
-            f.write(f"    True Positives: {combined.get('true_positives', 0)}\n")
-            f.write(f"    False Positives: {combined.get('false_positives', 0)}\n")
-            f.write(f"    False Negatives: {combined.get('false_negatives', 0)}\n")
-            f.write("\n")
-            
-            # Key Insights
-            f.write("[4] KEY INSIGHTS\n")
-            f.write("-" * 70 + "\n")
-            f1_change = combined.get('f1_score', 0) - svm.get('f1_score', 0)
-            precision_change = combined.get('precision', 0) - svm.get('precision', 0)
-            recall_change = combined.get('recall', 0) - svm.get('recall', 0)
-            
-            f.write(f"  Detection Performance Changes (SVM-only → Combined):\n")
-            f.write(f"    F1-Score Change: {f1_change:+.3f}\n")
-            f.write(f"    Precision Change: {precision_change:+.3f}\n")
-            f.write(f"    Recall Change: {recall_change:+.3f}\n\n")
-            
-            f.write(f"  Error Analysis:\n")
-            f.write(f"    SVM False Positives: {svm.get('false_positives', 0)}\n")
-            f.write(f"    Combined False Positives: {combined.get('false_positives', 0)}\n")
-            fp_reduction = svm.get('false_positives', 0) - combined.get('false_positives', 0)
-            f.write(f"    FP Reduction: {fp_reduction} ({100*fp_reduction/max(1,svm.get('false_positives',1)):.1f}%)\n\n")
-            
-            f.write(f"  Recommendations:\n")
-            if svr.get('avg_improvement', 0) < 0:
-                f.write(f"    [!] SVR is degrading performance - consider retraining or disabling\n")
-            if svm.get('recall', 0) < combined.get('recall', 0):
-                f.write(f"    [!] Combined approach has lower recall - SVR may be over-filtering\n")
-            if f1_change > 0.05:
-                f.write(f"    [+] SVR provides significant F1 improvement - keep using two-stage\n")
-            elif abs(f1_change) < 0.02:
-                f.write(f"    [~] Minimal F1 change - evaluate if SVR complexity is worth it\n")
-            
-            f.write("\n" + "=" * 70 + "\n")
-        
-        self.logger.info(f"Generated detailed evaluation report: {report_path}")
-        return str(report_path)
+    # Remove _generate_detailed_report (legacy, not used in single-stage pipeline)
     
     def clean_temp(self):
         """Clean temporary checkpoint files."""
@@ -814,6 +501,55 @@ def setup_logging():
     )
 
 
+def _shutdown_plot_backends():
+    """Close any plotting backends (matplotlib/plotly-kaleido) to avoid hanging threads."""
+    try:
+        import matplotlib.pyplot as plt
+        plt.close('all')
+    except Exception:
+        pass
+
+    try:
+        import plotly.io as pio
+        # Kaleido keeps a worker process alive; try to shut it down if present
+        scope = getattr(getattr(pio, "kaleido", None), "scope", None)
+        if scope and hasattr(scope, "_shutdown_kaleido"):
+            try:
+                scope._shutdown_kaleido()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _wait_for_background_threads(logger, timeout: float = 2.0) -> None:
+    """
+    Wait briefly for non-daemon threads to finish; log any lingerers.
+
+    If stubborn threads remain, forcefully terminate the process so CLI prompts return.
+    """
+    alive = [
+        t for t in threading.enumerate()
+        if t is not threading.current_thread() and t is not threading.main_thread() and t.is_alive()
+    ]
+    if not alive:
+        return
+
+    logger.info("Waiting for background threads to finish...")
+    for t in alive:
+        t.join(timeout=timeout)
+
+    remaining = [
+        t for t in threading.enumerate()
+        if t is not threading.current_thread() and t is not threading.main_thread() and t.is_alive()
+    ]
+    if remaining:
+        names = ", ".join(f"{t.name}" for t in remaining)
+        logger.warning(f"Forcing shutdown with lingering threads: {names}")
+        logging.shutdown()
+        os._exit(0)
+
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -822,10 +558,10 @@ def parse_arguments():
     )
     
     parser.add_argument(
-        '--config', 
-        type=str, 
+        'config',
+        nargs='?',
         default='config.yaml',
-        help='Path to configuration YAML file'
+        help='Path to configuration YAML file (default: config.yaml)'
     )
     
     parser.add_argument(
@@ -874,7 +610,7 @@ def main():
         # Parse and validate steps
         if not args.steps:
             # Default to all stages except save
-            steps = [s for s in NurdlePipeline.AVAILABLE_STAGES if s != 'save']
+            steps = [s for s in NurdlePipeline.AVAILABLE_STAGES if s not in ['save']]
             print(f"No steps specified, running default stages: {', '.join(steps)}")
         else:
             steps = [s.strip() for s in args.steps.split(',')]
@@ -908,6 +644,11 @@ def main():
         print(f"\nPipeline failed: {e}")
         logging.exception("Full error trace:")
         return 1
+    finally:
+        # Ensure plotting and background workers are shut down so the process can exit cleanly
+        _shutdown_plot_backends()
+        _wait_for_background_threads(logging.getLogger('NurdlePipeline'))
+        logging.shutdown()
 
 
 if __name__ == "__main__":

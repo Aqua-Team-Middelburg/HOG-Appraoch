@@ -7,12 +7,9 @@ including metrics calculation, coordinate matching, and results reporting.
 """
 
 from .evaluator import ModelEvaluator
-from .metrics import EvaluationMetrics, CoordinateMatching
-from .nms import NonMaximumSuppression
+from .metrics import EvaluationMetrics
 
 __all__ = [
     'ModelEvaluator',
-    'EvaluationMetrics', 
-    'CoordinateMatching',
-    'NonMaximumSuppression'
+    'EvaluationMetrics'
 ]

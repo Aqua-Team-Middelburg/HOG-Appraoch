@@ -2,8 +2,7 @@
 Metrics Calculation Module for Nurdle Detection Pipeline
 =======================================================
 
-This module provides comprehensive metrics calculation functionality,
-including count accuracy, coordinate errors, and detection performance.
+This module provides metrics calculation for single-stage SVM multi-class count prediction.
 """
 
 from typing import List, Tuple, Dict, Any, Optional
@@ -13,27 +12,22 @@ from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_er
 
 class EvaluationMetrics:
     """
-    Comprehensive metrics calculation for nurdle detection evaluation.
-    
-    Handles both count prediction and coordinate prediction metrics.
+    Metrics calculation for single-stage SVM multi-class count prediction.
     """
-    
+
     def __init__(self):
-        """Initialize metrics calculator."""
         pass
-    
-    def calculate_count_metrics(self, 
-                              ground_truth: List[int], 
-                              predictions: List[int],
-                              tolerance_percent: float = 10.0) -> Dict[str, float]:
+
+    def calculate_count_metrics(self,
+                                ground_truth: List[int],
+                                predictions: List[int],
+                                tolerance_percent: float = 10.0) -> Dict[str, float]:
         """
         Calculate count prediction metrics.
-        
         Args:
             ground_truth: List of actual nurdle counts
             predictions: List of predicted nurdle counts
             tolerance_percent: Percentage tolerance for count accuracy (default 10%)
-            
         Returns:
             Dictionary of count-related metrics
         """
@@ -44,119 +38,21 @@ class EvaluationMetrics:
                 'count_rmse': 0.0,
                 'count_bias': 0.0
             }
-        
-        # Calculate accuracy within tolerance (more realistic for count prediction)
-        # A prediction is accurate if within tolerance_percent of ground truth
         accurate_predictions = 0
         for gt, pred in zip(ground_truth, predictions):
-            tolerance = max(1, int(gt * tolerance_percent / 100))  # At least 1 nurdle tolerance
+            tolerance = max(1, int(gt * tolerance_percent / 100))
             if abs(pred - gt) <= tolerance:
                 accurate_predictions += 1
-        
         accuracy = accurate_predictions / len(ground_truth)
         mae = mean_absolute_error(ground_truth, predictions)
         rmse = np.sqrt(mean_squared_error(ground_truth, predictions))
-        
-        # Calculate bias (systematic over/under estimation)
         bias = np.mean(np.array(predictions) - np.array(ground_truth))
-        
         return {
             'count_accuracy': float(accuracy),
             'count_mae': float(mae),
             'count_rmse': float(rmse),
             'count_bias': float(bias)
         }
-    
-    def calculate_coordinate_metrics(self, coordinate_errors: List[float]) -> Dict[str, float]:
-        """
-        Calculate coordinate prediction metrics.
-        
-        Args:
-            coordinate_errors: List of coordinate error distances
-            
-        Returns:
-            Dictionary of coordinate-related metrics
-        """
-        if not coordinate_errors:
-            return {
-                'avg_coordinate_error': 0.0,
-                'median_coordinate_error': 0.0,
-                'std_coordinate_error': 0.0,
-                'max_coordinate_error': 0.0,
-                'min_coordinate_error': 0.0
-            }
-        
-        errors_array = np.array(coordinate_errors)
-        
-        return {
-            'avg_coordinate_error': float(np.mean(errors_array)),
-            'median_coordinate_error': float(np.median(errors_array)),
-            'std_coordinate_error': float(np.std(errors_array)),
-            'max_coordinate_error': float(np.max(errors_array)),
-            'min_coordinate_error': float(np.min(errors_array))
-        }
-    
-    def calculate_detection_metrics(self, detection_stats: Dict[str, int]) -> Dict[str, float]:
-        """
-        Calculate detection performance metrics (precision, recall, F1).
-        
-        Args:
-            detection_stats: Dictionary with 'true_positives', 'false_positives', 'false_negatives'
-            
-        Returns:
-            Dictionary of detection metrics
-        """
-        tp = detection_stats.get('true_positives', 0)
-        fp = detection_stats.get('false_positives', 0)
-        fn = detection_stats.get('false_negatives', 0)
-        
-        # Calculate precision, recall, and F1-score
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-        
-        return {
-            'precision': float(precision),
-            'recall': float(recall),
-            'f1_score': float(f1_score),
-            'true_positives': int(tp),
-            'false_positives': int(fp),
-            'false_negatives': int(fn)
-        }
-    
-    def calculate_all_metrics(self,
-                            count_ground_truth: List[int],
-                            count_predictions: List[int],
-                            coordinate_errors: List[float],
-                            detection_stats: Dict[str, int],
-                            n_test_images: int) -> Dict[str, float]:
-        """
-        Calculate all evaluation metrics in one call.
-        
-        Args:
-            count_ground_truth: List of actual nurdle counts
-            count_predictions: List of predicted nurdle counts
-            coordinate_errors: List of coordinate error distances
-            detection_stats: Detection statistics dictionary
-            n_test_images: Number of test images
-            
-        Returns:
-            Comprehensive metrics dictionary
-        """
-        # Calculate individual metric groups
-        count_metrics = self.calculate_count_metrics(count_ground_truth, count_predictions)
-        coord_metrics = self.calculate_coordinate_metrics(coordinate_errors)
-        detection_metrics = self.calculate_detection_metrics(detection_stats)
-        
-        # Combine all metrics
-        all_metrics = {
-            **count_metrics,
-            **coord_metrics,
-            **detection_metrics,
-            'n_test_images': int(n_test_images)
-        }
-        
-        return all_metrics
 
 
 class CoordinateMatching:
