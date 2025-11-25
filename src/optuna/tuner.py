@@ -17,6 +17,7 @@ from datetime import datetime
 from tqdm import tqdm
 from contextlib import contextmanager
 import math
+from optuna.trial import TrialState
 
 # Visualization imports (with fallback)
 try:
@@ -124,15 +125,24 @@ class OptunaTuner:
             study_name='svr_count_optimization',
             pruner=optuna.pruners.MedianPruner()
         )
+        interrupted = False
         trial_results = {}
+        # Ranges from config (overridable)
+        opt_cfg = {}
+        if isinstance(self.config, dict):
+            opt_cfg = self.config.get('svr_optimization', {}) or self.config.get('optimization', {}).get('svr_optimization', {}) or self.config.get('optimization', {}).get('svm_optimization', {})
+        c_range = opt_cfg.get('svr_c_range', [0.001, 100.0])
+        eps_range = opt_cfg.get('svr_epsilon_range', [0.01, 1.0])
+        gamma_range = opt_cfg.get('svr_gamma_range', [0.001, 1.0])
+
         def objective(trial):
             params = {
-                'svr_c': trial.suggest_float('svr_c', 0.001, 100.0, log=True),
+                'svr_c': trial.suggest_float('svr_c', c_range[0], c_range[1], log=True),
                 'svr_kernel': trial.suggest_categorical('svr_kernel', ['linear', 'rbf']),
-                'svr_epsilon': trial.suggest_float('svr_epsilon', 0.01, 1.0)
+                'svr_epsilon': trial.suggest_float('svr_epsilon', eps_range[0], eps_range[1])
             }
             if params['svr_kernel'] == 'rbf':
-                params['svr_gamma'] = trial.suggest_float('svr_gamma', 0.001, 1.0, log=True)
+                params['svr_gamma'] = trial.suggest_float('svr_gamma', gamma_range[0], gamma_range[1], log=True)
             try:
                 metrics = pipeline_trainer_func(params)
                 mae = float(metrics.get('mae', np.inf))
@@ -144,18 +154,29 @@ class OptunaTuner:
                 trial_results[trial.number] = {'params': params, 'metrics': {'mae': 1e6, 'error': str(e)}}
                 return 1e6
         n_trials = self.config.get('svr_optimization', {}).get('n_trials', 10)
-        with self._suppress_optuna_logging():
-            with tqdm(total=n_trials, desc="SVR Optimization", unit="trial") as pbar:
-                def callback(study, trial):
-                    pbar.update(1)
-                    pbar.set_postfix({"best_mae": f"{study.best_value:.2f}"})
-                study.optimize(objective, n_trials=n_trials, callbacks=[callback], show_progress_bar=False)
-        best_params = study.best_params
+        try:
+            with self._suppress_optuna_logging():
+                with tqdm(total=n_trials, desc="SVR Optimization", unit="trial") as pbar:
+                    def callback(study, trial):
+                        pbar.update(1)
+                        pbar.set_postfix({"best_mae": f"{study.best_value:.2f}" if study.best_value is not None else "n/a"})
+                    study.optimize(objective, n_trials=n_trials, callbacks=[callback], show_progress_bar=False)
+        except KeyboardInterrupt:
+            interrupted = True
+            self.logger.warning("SVR optimization interrupted; keeping best completed trials so far.")
+        # Guard against the case where no trial completed successfully
+        completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        if completed_trials:
+            best_params = study.best_params
+            best_value = float(study.best_value)
+        else:
+            best_params = {}
+            best_value = None
         best_trial_idx = None
         best_trial_metrics = None
         # Find best trial index and metrics
-        for t in study.trials:
-            if t.value == study.best_value:
+        for t in completed_trials:
+            if best_value is not None and t.value == best_value:
                 best_trial_idx = t.number
                 best_trial_metrics = trial_results.get(t.number, {}).get('metrics', None)
                 break
@@ -176,13 +197,14 @@ class OptunaTuner:
             })
         results_json = {
             'best_params': best_params,
-            'best_value': float(study.best_value),
-            'best_value_log10': math.log10(study.best_value) if study.best_value and study.best_value > 0 else None,
+            'best_value': best_value,
+            'best_value_log10': math.log10(best_value) if best_value and best_value > 0 else None,
             'n_trials': len(study.trials),
             'trial_results': trial_results,
             'best_trial_idx': best_trial_idx,
             'best_trial_metrics': best_trial_metrics,
             'trials': trials_summary,
+            'interrupted': interrupted,
         }
         with open(output_path / 'tuning_results.json', 'w') as f:
             json.dump(results_json, f, indent=2)
@@ -192,7 +214,7 @@ class OptunaTuner:
             best_params_path.unlink()
         self._save_optimization_results(study, output_path)
         self.best_params = best_params
-        self.best_value = study.best_value
+        self.best_value = best_value
         self.study = study
         return results_json
     
@@ -300,6 +322,12 @@ class OptunaTuner:
         """Save optimization results and visualizations for a single study."""
         try:
             output_path.mkdir(parents=True, exist_ok=True)
+            if len(study.trials) == 0:
+                self.logger.warning("No trials completed; skipping optimization visualizations.")
+                return
+            if not any(t.state == TrialState.COMPLETE for t in study.trials):
+                self.logger.warning("No completed trials to visualize; skipping plots.")
+                return
             
             # Save study
             study_path = output_path / "study.pkl"

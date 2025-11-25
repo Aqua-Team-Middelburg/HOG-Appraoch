@@ -86,7 +86,11 @@ class FeatureExtractor:
             output_dir: Directory to save visualizations
             num_samples: Max number of samples (default 3)
         """
-        import matplotlib.pyplot as plt
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            self.logger.warning("matplotlib not installed; skipping feature visualizations")
+            return
         from skimage import exposure
 
         output_path = Path(output_dir)

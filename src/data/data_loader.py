@@ -272,7 +272,11 @@ class DataLoader:
             output_dir: Directory to save visualizations
             num_samples: Maximum number of samples (limited by test set size, max 3)
         """
-        import matplotlib.pyplot as plt
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            self.logger.warning("matplotlib not installed; skipping normalization visualizations")
+            return
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)

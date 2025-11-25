@@ -29,8 +29,9 @@ class ModelTrainer:
         Returns:
             Dictionary with training metrics (on true counts)
         """
-        X = np.array([f for f, c in training_data])
-        y_true = np.array([c for f, c in training_data])
+        # Use float32 to keep the feature matrix light during tuning
+        X = np.asarray([f for f, c in training_data], dtype=np.float32)
+        y_true = np.asarray([c for f, c in training_data], dtype=np.float32)
         y_log = np.log1p(y_true)
         # Suppress all info-level logging during training/tuning
         self.svr_regressor = SVR(

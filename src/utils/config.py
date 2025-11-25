@@ -32,6 +32,33 @@ class Config:
         if self._config is None:
             return {}
         return self._config.get(section, {})
+
+    def apply_overrides(self, overrides: Dict[str, Any], allowed_paths=None) -> None:
+        """
+        Merge a dict of overrides into the loaded config.
+
+        allowed_paths: optional set of dotted paths (e.g., {"data.input_dir", "features.hog_cell_size"}).
+        If provided, only these paths (or their children) will be applied.
+        """
+        if self._config is None:
+            self.load()
+
+        def _allowed(path: str) -> bool:
+            if not allowed_paths:
+                return True
+            return any(path == a or a.startswith(path + ".") or path.startswith(a + ".") for a in allowed_paths)
+
+        def _merge(target: Dict[str, Any], patch: Dict[str, Any], prefix: str = ""):
+            for key, value in patch.items():
+                path = f"{prefix}.{key}" if prefix else key
+                if not _allowed(path):
+                    continue
+                if isinstance(value, dict) and isinstance(target.get(key), dict):
+                    _merge(target[key], value, path)
+                else:
+                    target[key] = value
+
+        _merge(self._config, overrides)
     
     @property 
     def data(self) -> Dict[str, Any]:

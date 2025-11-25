@@ -36,10 +36,10 @@ class NurdlePipeline:
     # Define available stages
     AVAILABLE_STAGES = ['normalization', 'features', 'tuning', 'training', 'evaluation', 'save']
     
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str = "config.yaml", config_obj=None):
         """Initialize pipeline with configuration."""
         self.config_path = config_path
-        self.config = load_config(config_path)  # Load config on init
+        self.config = config_obj or load_config(config_path)  # Load config on init
         self.logger = self._setup_logging()
         
         # Define checkpoint and output directories
@@ -64,6 +64,14 @@ class NurdlePipeline:
         self.evaluator = None
         
         self.logger.info("Modular pipeline initialized successfully")
+    
+    def _get_config_dict(self) -> Dict[str, Any]:
+        """Return the raw config dictionary regardless of wrapper type."""
+        if isinstance(self.config, dict):
+            return self.config
+        if hasattr(self.config, "_config"):
+            return self.config._config or {}
+        return {}
     
     # Remove _load_checkpoints (legacy, not used in single-stage pipeline)
     
@@ -282,19 +290,22 @@ class NurdlePipeline:
         self.feature_extractor = FeatureExtractor(feature_config)
         training_data = list(self.feature_extractor.generate_training_data(
             self.data_loader.train_annotations, self.data_loader.load_image))
-        config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
+        config_dict = self._get_config_dict()
         tuner = OptunaTuner(config_dict)
         def trainer_func(params):
             trainer = ModelTrainer({**config_dict, **params})
             return trainer.train_count_regressor(training_data)
         tuning_results = tuner.optimize(trainer_func, str(output_dir))
         best_params = tuning_results.get('best_params', {})
+        if tuning_results.get('interrupted'):
+            self.logger.warning("Tuning interrupted early; using best parameters from completed trials.")
         return {
             'best_params': best_params,
             'best_mae': tuning_results.get('best_value'),
             'n_trials': tuning_results.get('n_trials'),
             'output_dir': str(output_dir),
             'tuning_results_path': str(output_dir / 'tuning_results.json'),
+            'interrupted': tuning_results.get('interrupted', False),
         }
     
     def _run_training_stage(self) -> Dict[str, Any]:
@@ -321,8 +332,28 @@ class NurdlePipeline:
         self.feature_extractor = FeatureExtractor(feature_config)
         training_data = list(self.feature_extractor.generate_training_data(
             self.data_loader.train_annotations, self.data_loader.load_image))
-        config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
-        self.model_trainer = ModelTrainer(config_dict)
+        config_dict = self._get_config_dict()
+        # If tuning has already produced best params, merge them in for training
+        tuned_params = {}
+        tuning_results_path = self.output_dirs['tuning'] / 'tuning_results.json'
+        if tuning_results_path.exists():
+            try:
+                with open(tuning_results_path, 'r') as f:
+                    tuning_payload = json.load(f)
+                tuned_params = tuning_payload.get('best_params') or {}
+                if tuned_params:
+                    if tuning_payload.get('interrupted'):
+                        self.logger.warning("Tuning was interrupted; using best parameters found so far.")
+                    else:
+                        self.logger.info("Using tuned SVR parameters from tuning_results.json for training.")
+                else:
+                    self.logger.info("Tuning results found but no best parameters present; using defaults.")
+            except Exception as e:
+                self.logger.warning(f"Failed to read tuning results at {tuning_results_path}: {e}")
+        else:
+            self.logger.info("No tuning results found; training with default SVR parameters.")
+        trainer_config = {**config_dict, **tuned_params}
+        self.model_trainer = ModelTrainer(trainer_config)
         training_metrics = self.model_trainer.train_count_regressor(training_data)
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self.model_trainer.save_model(str(self.models_dir))
@@ -384,7 +415,11 @@ class NurdlePipeline:
         }
         with open(output_dir / 'evaluation_metrics.json', 'w') as f:
             json.dump(eval_metrics, f, indent=2)
-        import matplotlib.pyplot as plt
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            plt = None
+            self.logger.warning("matplotlib not installed; skipping evaluation plots")
         training_output_dir = self.output_dirs['training']
         training_metrics_path = training_output_dir / 'training_metrics.json'
         if training_metrics_path.exists():
@@ -393,7 +428,7 @@ class NurdlePipeline:
         else:
             training_metrics = None
             self.logger.warning(f"Training metrics not found at {training_metrics_path}; skipping train/test comparison plot")
-        if training_metrics:
+        if training_metrics and plt:
             metrics_names = ['MAE', 'RMSE', 'MAPE']
             train_vals = [
                 training_metrics.get('mae', 0),
@@ -413,16 +448,17 @@ class NurdlePipeline:
             plt.savefig(output_dir / 'train_vs_test_metrics.png')
             plt.close()
         # Individual test image visualizations
-        for ann, pred_count in zip(test_annots, y_pred):
-            img = self.data_loader.load_image(ann.image_path)
-            actual_count = ann.nurdle_count
-            plt.figure(figsize=(6, 6))
-            plt.imshow(img, cmap='gray')
-            plt.title(f"Actual: {actual_count} | Predicted: {pred_count:.1f}")
-            plt.axis('off')
-            out_path = output_dir / f"{ann.image_id}_eval.png"
-            plt.savefig(out_path, bbox_inches='tight')
-            plt.close()
+        if plt:
+            for ann, pred_count in zip(test_annots, y_pred):
+                img = self.data_loader.load_image(ann.image_path)
+                actual_count = ann.nurdle_count
+                plt.figure(figsize=(6, 6))
+                plt.imshow(img, cmap='gray')
+                plt.title(f"Actual: {actual_count} | Predicted: {pred_count:.1f}")
+                plt.axis('off')
+                out_path = output_dir / f"{ann.image_id}_eval.png"
+                plt.savefig(out_path, bbox_inches='tight')
+                plt.close()
         return {
             'evaluation_metrics': eval_metrics,
             'visualization_dir': str(output_dir)
@@ -570,6 +606,18 @@ def parse_arguments():
         default=None,
         help='Comma-separated list of stages to run (default: all stages except save). Options: normalization,windows,features,tuning,training,evaluation,save'
     )
+    parser.add_argument(
+        '--job-id',
+        type=str,
+        default=None,
+        help='Optional job identifier to tag logs/status outputs'
+    )
+    parser.add_argument(
+        '--config-overrides',
+        type=str,
+        default=None,
+        help='Optional JSON string of config overrides (whitelisted keys only)'
+    )
     
     parser.add_argument(
         '--clean-temp',
@@ -597,9 +645,40 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # Prepare config
+    config_loader = load_config(args.config)
+    if args.config_overrides:
+        try:
+            overrides = json.loads(args.config_overrides)
+        except json.JSONDecodeError as e:
+            print(f"Invalid --config-overrides JSON: {e}")
+            return 1
+        allowed = {
+            "data.input_dir",
+            "data.save_dir",
+            "data.train_test_ratio",
+            "data.target_resolution",
+            "data.batch_size",
+            "features.hog_cell_size",
+            "features.image_size",
+            "svr_optimization.n_trials",
+            "svr_optimization.svr_c_range",
+            "svr_optimization.svr_epsilon_range",
+            "svr_optimization.svr_gamma_range",
+        }
+        config_loader.apply_overrides(overrides, allowed_paths=allowed)
+
+    job_id = args.job_id
+    job_dir = None
+    if job_id:
+        job_dir = Path("output") / "runs" / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+    start_time = datetime.now().isoformat()
+
     try:
         # Initialize pipeline
-        pipeline = NurdlePipeline(args.config)
+        pipeline = NurdlePipeline(args.config, config_obj=config_loader)
         
         # Clean temp if requested
         if args.clean_temp:
@@ -633,16 +712,51 @@ def main():
             for key, value in result.items():
                 print(f"  {key}: {value}")
         print("=" * 80)
+
+        if job_dir:
+            status = {
+                "job_id": job_id,
+                "status": "success",
+                "started": start_time,
+                "finished": datetime.now().isoformat(),
+                "steps": steps,
+                "results": results,
+                "log_dir": "output/logs",
+            }
+            with open(job_dir / "status.json", "w") as f:
+                json.dump(status, f, indent=2)
         
         return 0
         
     except KeyboardInterrupt:
         print("\nPipeline interrupted by user")
+        if job_dir:
+            status = {
+                "job_id": job_id,
+                "status": "failed",
+                "error": "interrupted",
+                "started": start_time,
+                "finished": datetime.now().isoformat(),
+                "steps": steps if 'steps' in locals() else None,
+            }
+            with open(job_dir / "status.json", "w") as f:
+                json.dump(status, f, indent=2)
         return 1
         
     except Exception as e:
         print(f"\nPipeline failed: {e}")
         logging.exception("Full error trace:")
+        if job_dir:
+            status = {
+                "job_id": job_id,
+                "status": "failed",
+                "error": str(e),
+                "started": start_time,
+                "finished": datetime.now().isoformat(),
+                "steps": steps if 'steps' in locals() else None,
+            }
+            with open(job_dir / "status.json", "w") as f:
+                json.dump(status, f, indent=2)
         return 1
     finally:
         # Ensure plotting and background workers are shut down so the process can exit cleanly
