@@ -178,8 +178,5 @@ saved_outputs/
 #random image selector script
 copy_random_images.py
 
-#frontend folder
-frontend/
-
 #copilot instructions
 .github/copilot-instructions/

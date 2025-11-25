@@ -1,0 +1,655 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Nurdle Pipeline Console</title>
+  <style>
+    :root {
+      --bg: #0a0f1d;
+      --panel: #0f1628;
+      --panel-2: #111a2e;
+      --accent: #26d9d2;
+      --accent-2: #8b5cf6;
+      --text: #e7edf6;
+      --muted: #9fb2cc;
+      --border: #1f2b42;
+      --code: #0c1425;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Plus Jakarta Sans", "Segoe UI", -apple-system, system-ui, sans-serif;
+      background: radial-gradient(circle at 10% 20%, rgba(38,217,210,0.08), transparent 35%),
+                  radial-gradient(circle at 90% 10%, rgba(139,92,246,0.08), transparent 30%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    a { color: var(--accent); }
+    .wrap { max-width: 1400px; margin: 0 auto; padding: 28px 22px 40px; }
+    .hero {
+      background: linear-gradient(135deg, rgba(38,217,210,0.12), rgba(139,92,246,0.12));
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px 20px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+    }
+    .hero h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: 0.2px; }
+    .hero p { margin: 0; color: var(--muted); }
+    .chips { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+    .chip {
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .shell { display: grid; grid-template-columns: 320px 1fr 360px; gap: 16px; margin-top: 14px; align-items: start; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+    }
+    .section-title {
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 10px;
+    }
+    .stages { display: grid; gap: 8px; }
+    .stage {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      cursor: pointer;
+      transition: border 0.2s, transform 0.15s, box-shadow 0.2s;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .stage:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .stage.active {
+      border-color: var(--accent);
+      box-shadow: 0 6px 18px rgba(38,217,210,0.18);
+    }
+    .stage .info { display: flex; flex-direction: column; gap: 2px; }
+    .stage .label { font-weight: 600; }
+    .stage .hint { color: var(--muted); font-size: 12px; }
+    .stage .badge {
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .controls { display: grid; gap: 10px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input[type="text"], textarea {
+      width: 100%;
+      background: var(--code);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 13px;
+    }
+    textarea { min-height: 72px; resize: vertical; }
+    .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .btn-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    button {
+      border: none;
+      padding: 12px 14px;
+      border-radius: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      color: #041121;
+      background: linear-gradient(135deg, #26d9d2, #2fd6ff);
+      box-shadow: 0 12px 30px rgba(38,217,210,0.35);
+    }
+    button.secondary {
+      background: linear-gradient(135deg, #8b5cf6, #c084fc);
+      color: #0b1020;
+    }
+    button:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
+    .status-box {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      min-height: 64px;
+      font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      color: var(--text);
+      max-height: 320px;
+      overflow: auto;
+    }
+    pre {
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      max-height: 640px;
+      overflow: auto;
+      color: #cde3ff;
+      font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+    .pill {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      background: rgba(255,255,255,0.03);
+    }
+    .muted { color: var(--muted); }
+    .stage-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+    .tab {
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      cursor: pointer;
+      color: var(--text);
+      font-weight: 600;
+    }
+    .tab.active {
+      border-color: var(--accent);
+      box-shadow: 0 6px 18px rgba(38,217,210,0.18);
+    }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 10px; font-size: 13px; color: var(--text); }
+    .kv .k { color: var(--muted); }
+    .artifact-list { margin-top: 8px; display: grid; gap: 8px; max-height: 340px; overflow: auto; }
+    .artifact {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px;
+      background: var(--panel-2);
+    }
+    .artifact .meta { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+    .thumb { margin-top: 6px; max-height: 180px; max-width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+    .flex-col { display: flex; flex-direction: column; gap: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <h1>Nurdle Pipeline</h1>
+      <p>Pick stages, adjust knobs, and launch. Status in the center, logs on the right; browse artifacts in the stage viewer.</p>
+      <div class="chips">
+        <div class="chip">Default config: config.yaml</div>
+        <div class="chip">Job dir: output/runs/&lt;job_id&gt;</div>
+        <div class="chip" id="job-chip">Job: none</div>
+      </div>
+    </div>
+
+    <div class="shell">
+      <div class="flex-col">
+        <div class="card">
+          <div class="section-title">Stages</div>
+          <div id="stage-list" class="stages"></div>
+        </div>
+
+        <div class="card">
+          <div class="section-title">Config overrides</div>
+          <div class="controls">
+            <div class="row">
+              <div>
+                <label>Input dir (data.input_dir)</label>
+                <input type="text" id="input-dir" placeholder="input">
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label>Train/Test split (data.train_test_ratio)</label>
+                <input type="text" id="train-split" placeholder="0.8">
+              </div>
+              <div>
+                <label>Target resolution (data.target_resolution)</label>
+                <input type="text" id="target-res" placeholder="1080">
+              </div>
+              <div>
+                <label>Batch size (data.batch_size)</label>
+                <input type="text" id="batch-size" placeholder="15">
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label>HOG cell size (features.hog_cell_size)</label>
+                <input type="text" id="hog-cell" placeholder="[5,5]">
+              </div>
+              <div>
+                <label>Image size (features.image_size)</label>
+                <input type="text" id="img-size" placeholder="[1080,1080]">
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label>Optuna trials (svr_optimization.n_trials)</label>
+                <input type="text" id="trials" placeholder="10">
+              </div>
+              <div>
+                <label>SVR C range</label>
+                <input type="text" id="c-range" placeholder="[0.001, 100]">
+              </div>
+              <div>
+                <label>Epsilon range</label>
+                <input type="text" id="eps-range" placeholder="[0.01, 1.0]">
+              </div>
+              <div>
+                <label>Gamma range</label>
+                <input type="text" id="gamma-range" placeholder="[0.001, 1.0]">
+              </div>
+            </div>
+            <div class="btn-bar">
+              <button id="run-btn">Run selected stages</button>
+              <div class="pill" id="poll-pill">Idle</div>
+            </div>
+            <div class="muted" style="font-size:12px;">Tip: use Save stage in the viewer to zip output to your chosen directory.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex-col">
+        <div class="card">
+          <div class="section-title">Status</div>
+          <div id="status-box" class="status-box">No run yet.</div>
+        </div>
+
+        <div class="card">
+          <div class="section-title">Stage viewer</div>
+          <div id="stage-tabs" class="stage-tabs"></div>
+          <div id="stage-summary" class="kv" style="margin-top:10px;"></div>
+          <div style="margin-top:10px;">
+            <div class="section-title" style="margin-bottom:6px;">Artifacts</div>
+            <div id="artifact-holder" class="muted">Browse files to load artifacts.</div>
+            <div class="btn-bar" style="margin-top:8px;">
+              <button id="browse-btn">Browse files</button>
+              <div class="pill" id="artifact-pill">Idle</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="section-title">Log</div>
+        <pre id="log-box">No log yet.</pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const stageDefs = [
+      { key: "normalization", label: "Normalization", hint: "load & normalize" },
+      { key: "features", label: "Features", hint: "RGB HOG + LBP visuals" },
+      { key: "tuning", label: "Tuning", hint: "Optuna SVR trials" },
+      { key: "training", label: "Training", hint: "Train SVR regressor" },
+      { key: "evaluation", label: "Evaluation", hint: "Metrics & plots" },
+      { key: "save", label: "Save", hint: "Zip output -> save_dir" },
+    ];
+
+    const stageDirs = {
+      normalization: ["output/01_normalization", "temp/normalized"],
+      features: ["output/02_features"],
+      tuning: ["output/03_tuning"],
+      training: ["output/04_training", "output/models"],
+      evaluation: ["output/05_evaluation"],
+      save: [],
+    };
+
+    let selectedStages = new Set(stageDefs.filter(s => s.key !== "save").map(s => s.key));
+    let currentStage = "normalization";
+    let currentJob = null;
+    let logTimer = null;
+    let statusTimer = null;
+    let autoScrollLog = true;
+    const artifactCache = {};
+    let latestResults = {};
+
+    function renderStages() {
+      const list = document.getElementById("stage-list");
+      list.innerHTML = "";
+      stageDefs.forEach(stage => {
+        const div = document.createElement("div");
+        div.className = "stage" + (selectedStages.has(stage.key) ? " active" : "");
+        div.onclick = () => {
+          if (selectedStages.has(stage.key)) selectedStages.delete(stage.key);
+          else selectedStages.add(stage.key);
+          renderStages();
+        };
+        div.innerHTML = `
+          <div class="info">
+            <span class="label">${stage.label}</span>
+            <span class="hint">${stage.hint}</span>
+          </div>
+          <span class="badge">${selectedStages.has(stage.key) ? "on" : "off"}</span>
+        `;
+        list.appendChild(div);
+      });
+    }
+
+    function renderStageTabs() {
+      const tabs = document.getElementById("stage-tabs");
+      tabs.innerHTML = "";
+      stageDefs.forEach(stage => {
+        const t = document.createElement("div");
+        t.className = "tab" + (currentStage === stage.key ? " active" : "");
+        t.textContent = stage.label;
+        t.onclick = () => { currentStage = stage.key; renderStageDetail(); };
+        tabs.appendChild(t);
+      });
+    }
+
+    function setStatus(msg) { document.getElementById("status-box").textContent = msg; }
+    function setLog(text) {
+      const box = document.getElementById("log-box");
+      box.textContent = text || "No log.";
+      if (autoScrollLog) box.scrollTop = box.scrollHeight;
+    }
+    function setPollState(txt) { document.getElementById("poll-pill").textContent = txt; }
+    function setArtifactState(txt) { document.getElementById("artifact-pill").textContent = txt; }
+
+    function renderStageDetail() {
+      const summaryBox = document.getElementById("stage-summary");
+      const holder = document.getElementById("artifact-holder");
+      const browseBtn = document.getElementById("browse-btn");
+      summaryBox.innerHTML = "";
+      const data = latestResults[currentStage];
+      if (!data) {
+        summaryBox.innerHTML = `<span class="k">Status</span><span class="muted">no data yet</span>`;
+      } else {
+        Object.entries(data).forEach(([k,v]) => {
+          const val = typeof v === "object" ? JSON.stringify(v) : v;
+          summaryBox.innerHTML += `<span class="k">${k}</span><span>${val}</span>`;
+        });
+      }
+      const hasDirs = (stageDirs[currentStage] || []).length > 0;
+      if (!hasDirs) {
+        browseBtn.disabled = true;
+        browseBtn.textContent = "No files (Save zips output)";
+        holder.className = "muted";
+        holder.innerHTML = "Save stage creates a zip in save_dir.";
+      } else {
+        browseBtn.disabled = false;
+        browseBtn.textContent = "Browse files";
+        holder.className = "muted";
+        holder.innerHTML = "Browse files to see artifacts.";
+      }
+      setArtifactState("Idle");
+    }
+
+    function renderArtifactList(holder, data) {
+      if (!data || !data.items || data.items.length === 0) {
+        holder.className = "muted";
+        holder.textContent = "No files found in expected output folders.";
+        return;
+      }
+      holder.className = "artifact-list";
+      holder.innerHTML = "";
+      data.items.forEach(item => {
+        const row = document.createElement("div");
+        row.className = "artifact";
+        const link = item.is_dir ? `<span>${item.name} (dir)</span>` :
+          `<a href="/artifact?path=${encodeURIComponent(item.path)}" target="_blank" rel="noopener">${item.name}</a>`;
+        row.innerHTML = `<div class="meta"><span>${item.is_dir ? "dir" : "file"}</span><span>${item.path}</span></div>${link}`;
+        if (!item.is_dir && item.name.match(/\.(png|jpg|jpeg|gif|bmp|webp)$/i)) {
+          const img = document.createElement("img");
+          img.src = `/artifact?path=${encodeURIComponent(item.path)}`;
+          img.className = "thumb";
+          row.appendChild(img);
+        }
+        holder.appendChild(row);
+      });
+    }
+
+    async function loadArtifactsForStage(stageKey) {
+      if (artifactCache[stageKey]) return artifactCache[stageKey];
+      const dirs = stageDirs[stageKey] || [];
+      for (const dir of dirs) {
+        try {
+          const res = await callApi(`/artifacts?path=${encodeURIComponent(dir)}`);
+          artifactCache[stageKey] = res;
+          return res;
+        } catch (e) {
+          // try next dir
+        }
+      }
+      throw new Error("No artifacts found for this stage yet.");
+    }
+
+    async function browseArtifacts() {
+      const holder = document.getElementById("artifact-holder");
+      if (currentStage === "save") {
+        const input = document.getElementById("save-dir-input");
+        const saveDir = input && input.value.trim() ? input.value.trim() : "saved_outputs";
+        holder.textContent = "Starting save...";
+        setArtifactState("Saving...");
+        try {
+          const body = { save_dir: saveDir };
+          const res = await fetch("/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!res.ok) {
+            const text = await res.text();
+            throw new Error(text || res.statusText);
+          }
+          const data = await res.json();
+          holder.textContent = `Save started. Job ${data.job_id} (pid ${data.pid})`;
+          setArtifactState("Save started");
+        } catch (e) {
+          holder.textContent = e.message || "Could not start save.";
+          setArtifactState("Error");
+        }
+        return;
+      }
+      holder.className = "muted";
+      holder.textContent = "Loading...";
+      setArtifactState("Loading...");
+      try {
+        const data = await loadArtifactsForStage(currentStage);
+        renderArtifactList(holder, data);
+        setArtifactState("Loaded");
+      } catch (e) {
+        holder.textContent = e.message || "Could not load artifacts.";
+        setArtifactState("Error");
+      }
+    }
+
+    function buildOverrides() {
+      const o = {};
+      const inputDir = document.getElementById("input-dir").value.trim();
+      const saveDir = document.getElementById("save-dir").value.trim();
+      const trainSplit = document.getElementById("train-split").value.trim();
+      const targetRes = document.getElementById("target-res").value.trim();
+      const batchSize = document.getElementById("batch-size").value.trim();
+      const hogCell = document.getElementById("hog-cell").value.trim();
+      const imgSize = document.getElementById("img-size").value.trim();
+      const trials = document.getElementById("trials").value.trim();
+      const cRange = document.getElementById("c-range").value.trim();
+      const epsRange = document.getElementById("eps-range").value.trim();
+      const gammaRange = document.getElementById("gamma-range").value.trim();
+      if (inputDir) o.data = { ...(o.data||{}), input_dir: inputDir };
+      if (saveDir) o.data = { ...(o.data||{}), save_dir: saveDir };
+      if (trainSplit) o.data = { ...(o.data||{}), train_test_ratio: parseFloat(trainSplit) };
+      if (targetRes) o.data = { ...(o.data||{}), target_resolution: parseInt(targetRes, 10) };
+      if (batchSize) o.data = { ...(o.data||{}), batch_size: parseInt(batchSize, 10) };
+      if (hogCell) o.features = { ...(o.features||{}), hog_cell_size: JSON.parse(hogCell) };
+      if (imgSize) o.features = { ...(o.features||{}), image_size: JSON.parse(imgSize) };
+      if (trials || cRange || epsRange || gammaRange) o.svr_optimization = { ...(o.svr_optimization||{}) };
+      if (trials) o.svr_optimization.n_trials = parseInt(trials, 10);
+      if (cRange) o.svr_optimization.svr_c_range = JSON.parse(cRange);
+      if (epsRange) o.svr_optimization.svr_epsilon_range = JSON.parse(epsRange);
+      if (gammaRange) o.svr_optimization.svr_gamma_range = JSON.parse(gammaRange);
+      return o;
+    }
+
+    async function loadConfig() {
+      try {
+        const cfg = await callApi("/config");
+        const data = cfg.data || {};
+        const feats = cfg.features || {};
+        const svr = cfg.svr_optimization || cfg.optimization?.svr_optimization || cfg.optimization?.svm_optimization || {};
+        const defaults = { c_range: [0.001, 100], eps_range: [0.01, 1.0], gamma_range: [0.001, 1.0] };
+        document.getElementById("input-dir").value = data.input_dir ?? "input";
+        document.getElementById("save-dir").value = data.save_dir ?? "saved_outputs";
+        document.getElementById("train-split").value = data.train_test_ratio ?? "0.8";
+        document.getElementById("target-res").value = data.target_resolution ?? "1080";
+        document.getElementById("batch-size").value = data.batch_size ?? "15";
+        document.getElementById("hog-cell").value = feats.hog_cell_size ? JSON.stringify(feats.hog_cell_size) : "[5,5]";
+        document.getElementById("img-size").value = feats.image_size ? JSON.stringify(feats.image_size) : "[1080,1080]";
+        document.getElementById("trials").value = svr.n_trials ?? "10";
+        document.getElementById("c-range").value = svr.svr_c_range ? JSON.stringify(svr.svr_c_range) : JSON.stringify(defaults.c_range);
+        document.getElementById("eps-range").value = svr.svr_epsilon_range ? JSON.stringify(svr.svr_epsilon_range) : JSON.stringify(defaults.eps_range);
+        document.getElementById("gamma-range").value = svr.svr_gamma_range ? JSON.stringify(svr.svr_gamma_range) : JSON.stringify(defaults.gamma_range);
+      } catch (e) {
+        console.warn("Could not load config:", e);
+      }
+    }
+
+    function resetUIForNewRun() {
+      setStatus("Starting...");
+      setLog("Waiting for first log chunk...");
+      latestResults = {};
+      Object.keys(artifactCache).forEach(k => delete artifactCache[k]);
+      renderStageDetail();
+      setPollState("Polling...");
+    }
+
+    async function startRun(isSaveOnly=false) {
+      if (selectedStages.size === 0 && !isSaveOnly) {
+        alert("Select at least one stage.");
+        return;
+      }
+      const body = {
+        steps: isSaveOnly ? ["save"] : Array.from(selectedStages),
+        config_overrides: buildOverrides()
+      };
+      resetUIForNewRun();
+      try {
+        const data = await callApi("/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        currentJob = data.job_id;
+        document.getElementById("job-chip").textContent = `Job: ${currentJob}`;
+        setStatus("Running...");
+        startPolling();
+      } catch (e) {
+        setStatus("Error: " + e.message);
+        setPollState("Idle");
+      }
+    }
+
+    function startPolling() {
+      stopPolling();
+      statusTimer = setInterval(fetchStatus, 2000);
+      logTimer = setInterval(fetchLog, 2000);
+      setPollState("Polling...");
+    }
+    function stopPolling() {
+      if (statusTimer) {
+        clearInterval(statusTimer);
+        statusTimer = null;
+      }
+      if (logTimer) {
+        clearInterval(logTimer);
+        logTimer = null;
+      }
+      setPollState("Idle");
+    }
+
+    async function fetchStatus() {
+      if (!currentJob) return;
+      try {
+        const data = await callApi(`/runs/${currentJob}`);
+        const statusText = data.status || data.detail || "unknown";
+        setStatus(JSON.stringify(data, null, 2));
+        latestResults = data.results || {};
+        renderStageDetail();
+        const statusLower = String(statusText).toLowerCase();
+        if (["success", "failed", "error"].includes(statusLower)) {
+          stopPolling();
+        }
+      } catch (e) {
+        setStatus("Status error: " + e.message);
+      }
+    }
+
+    async function fetchLog() {
+      if (!currentJob) return;
+      try {
+        const data = await callApi(`/runs/${currentJob}/logs`);
+        setLog(data.log);
+        const lower = data.log.toLowerCase();
+        if (lower.includes("pipeline completed successfully") || lower.includes("pipeline interrupted")) {
+          stopPolling();
+        }
+      } catch (e) {
+        setLog("Log error: " + e.message);
+      }
+    }
+
+    document.getElementById("run-btn").onclick = () => startRun(false);
+    document.getElementById("browse-btn").onclick = browseArtifacts;
+    document.getElementById("log-box").addEventListener("scroll", () => {
+      const box = document.getElementById("log-box");
+      const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 10;
+      autoScrollLog = atBottom;
+    });
+    renderStages();
+    renderStageTabs();
+    renderStageDetail();
+    loadConfig();
+  </script>
+</body>
+</html>
+    function renderStageDetail() {
+      const summaryBox = document.getElementById("stage-summary");
+      const holder = document.getElementById("artifact-holder");
+      const browseBtn = document.getElementById("browse-btn");
+      summaryBox.innerHTML = "";
+      const data = latestResults[currentStage];
+      if (!data) {
+        summaryBox.innerHTML = `<span class="k">Status</span><span class="muted">no data yet</span>`;
+      } else {
+        Object.entries(data).forEach(([k,v]) => {
+          const val = typeof v === "object" ? JSON.stringify(v) : v;
+          summaryBox.innerHTML += `<span class="k">${k}</span><span>${val}</span>`;
+        });
+      }
+      const hasDirs = (stageDirs[currentStage] || []).length > 0;
+      if (currentStage === "save") {
+        browseBtn.textContent = "Save outputs";
+        browseBtn.disabled = false;
+        holder.className = "muted";
+        holder.innerHTML = `
+          <div class="kv">
+            <span class="k">Save dir</span>
+            <span><input type="text" id="save-dir-input" placeholder="saved_outputs" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--code);color:var(--text);"></span>
+            <span class="k">Status</span>
+            <span>Click "Save outputs" to zip current output/ to save_dir.</span>
+          </div>
+        `;
+        setArtifactState("Idle");
+      } else if (!hasDirs) {
+        browseBtn.disabled = true;
+        browseBtn.textContent = "No files";
+        holder.className = "muted";
+        holder.innerHTML = "No files for this stage.";
+        setArtifactState("Idle");
+      } else {
+        browseBtn.disabled = false;
+        browseBtn.textContent = "Browse files";
+        holder.className = "muted";
+        holder.innerHTML = "Browse files to see artifacts.";
+        setArtifactState("Idle");
+      }
+    }
