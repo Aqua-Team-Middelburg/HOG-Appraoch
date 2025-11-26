@@ -198,30 +198,32 @@ class DataLoader:
             'test_ids': [ann.image_id for ann in self.test_annotations],
             'image_metadata': {}
         }
-        for annotation in self.annotations:
-            try:
-                original_image = cv2.imread(annotation.image_path)
-                if original_image is None:
-                    self.logger.warning(f"Could not load {annotation.image_path}")
-                    continue
-                orig_h, orig_w = original_image.shape[:2]
-                normalized_image = self.normalize_image(original_image)
-                norm_h, norm_w = normalized_image.shape[:2]
-                scale_x = norm_w / orig_w
-                scale_y = norm_h / orig_h
-                image_filename = f"{annotation.image_id}.png"
-                image_path = images_dir / image_filename
-                cv2.imwrite(str(image_path), normalized_image)
-                metadata['image_metadata'][annotation.image_id] = {
-                    'original_path': annotation.image_path,
-                    'normalized_path': str(image_path),
-                    'original_dimensions': {'width': orig_w, 'height': orig_h},
-                    'normalized_dimensions': {'width': norm_w, 'height': norm_h},
-                    'scale_factors': {'x': scale_x, 'y': scale_y},
-                    'nurdle_count': annotation.nurdle_count
-                }
-            except Exception as e:
-                self.logger.error(f"Error saving {annotation.image_path}: {e}")
+        for batch in self.get_image_batches(self.annotations):
+            self.logger.debug(f"Normalizing batch of {len(batch)} images (batch_size={self.batch_size})")
+            for annotation in batch:
+                try:
+                    original_image = cv2.imread(annotation.image_path)
+                    if original_image is None:
+                        self.logger.warning(f"Could not load {annotation.image_path}")
+                        continue
+                    orig_h, orig_w = original_image.shape[:2]
+                    normalized_image = self.normalize_image(original_image)
+                    norm_h, norm_w = normalized_image.shape[:2]
+                    scale_x = norm_w / orig_w
+                    scale_y = norm_h / orig_h
+                    image_filename = f"{annotation.image_id}.png"
+                    image_path = images_dir / image_filename
+                    cv2.imwrite(str(image_path), normalized_image)
+                    metadata['image_metadata'][annotation.image_id] = {
+                        'original_path': annotation.image_path,
+                        'normalized_path': str(image_path),
+                        'original_dimensions': {'width': orig_w, 'height': orig_h},
+                        'normalized_dimensions': {'width': norm_w, 'height': norm_h},
+                        'scale_factors': {'x': scale_x, 'y': scale_y},
+                        'nurdle_count': annotation.nurdle_count
+                    }
+                except Exception as e:
+                    self.logger.error(f"Error saving {annotation.image_path}: {e}")
         metadata_path = checkpoint_dir / 'metadata.json'
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)

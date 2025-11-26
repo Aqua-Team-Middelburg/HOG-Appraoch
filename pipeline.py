@@ -2,11 +2,10 @@ import argparse
 import logging
 import sys
 import shutil
-import cv2
 import json
 import zipfile
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Tuple
 from datetime import datetime
 import numpy as np
 import os
@@ -19,7 +18,6 @@ try:
     from src.features import FeatureExtractor
     from src.models import ModelTrainer
     from src.evaluation import ModelEvaluator
-    from tqdm import tqdm
 except ImportError as e:
     print(f"Error importing pipeline components: {e}")
     print("Make sure all src modules are properly installed")
@@ -66,6 +64,19 @@ class NurdlePipeline:
         self.logger.info("Modular pipeline initialized successfully")
     
     # Remove _load_checkpoints (legacy, not used in single-stage pipeline)
+
+    def _get_feature_image_size(self) -> tuple:
+        """
+        Resolve the feature extraction image size from config.
+
+        Prefers explicit features.image_size; otherwise falls back to a square
+        sized to data.target_resolution so we only need one resolution setting.
+        """
+        feature_size = self.config.features.get('image_size')
+        if feature_size:
+            return tuple(feature_size)
+        target_res = self.config.data.get('target_resolution', 1080)
+        return (target_res, target_res)
     
     def _setup_logging(self):
         """Setup pipeline-specific logging."""
@@ -244,9 +255,10 @@ class NurdlePipeline:
         self.logger.info("Extracting features for all images...")
         self.data_loader = DataLoader(self.config.data)
         self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        image_size = self._get_feature_image_size()
         feature_config = {
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': self.config.features.get('image_size', [1080, 1080])
+            'image_size': image_size
         }
         self.feature_extractor = FeatureExtractor(feature_config)
         # Visualize feature samples for up to 3 test images
@@ -275,13 +287,18 @@ class NurdlePipeline:
         self.logger.info("Loading normalized data for tuning...")
         self.data_loader = DataLoader(self.config.data)
         self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        image_size = self._get_feature_image_size()
         feature_config = {
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': self.config.features.get('image_size', [1080, 1080])
+            'image_size': image_size
         }
         self.feature_extractor = FeatureExtractor(feature_config)
-        training_data = list(self.feature_extractor.generate_training_data(
-            self.data_loader.train_annotations, self.data_loader.load_image))
+        training_data: List[Tuple[np.ndarray, int]] = []
+        for batch in self.data_loader.get_image_batches(self.data_loader.train_annotations):
+            self.logger.debug(f"Tuning: processing batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
+            batch_pairs = list(self.feature_extractor.generate_training_data(
+                batch, self.data_loader.load_image))
+            training_data.extend(batch_pairs)
         config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
         tuner = OptunaTuner(config_dict)
         def trainer_func(params):
@@ -314,13 +331,18 @@ class NurdlePipeline:
         self.logger.info("Loading normalized data for training...")
         self.data_loader = DataLoader(self.config.data)
         self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        image_size = self._get_feature_image_size()
         feature_config = {
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': self.config.features.get('image_size', [1080, 1080])
+            'image_size': image_size
         }
         self.feature_extractor = FeatureExtractor(feature_config)
-        training_data = list(self.feature_extractor.generate_training_data(
-            self.data_loader.train_annotations, self.data_loader.load_image))
+        training_data: List[Tuple[np.ndarray, int]] = []
+        for batch in self.data_loader.get_image_batches(self.data_loader.train_annotations):
+            self.logger.debug(f"Training: processing batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
+            batch_pairs = list(self.feature_extractor.generate_training_data(
+                batch, self.data_loader.load_image))
+            training_data.extend(batch_pairs)
         config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
         self.model_trainer = ModelTrainer(config_dict)
         training_metrics = self.model_trainer.train_count_regressor(training_data)
@@ -355,9 +377,10 @@ class NurdlePipeline:
         self.logger.info("Loading normalized data for evaluation...")
         self.data_loader = DataLoader(self.config.data)
         self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        image_size = self._get_feature_image_size()
         feature_config = {
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': self.config.features.get('image_size', [1080, 1080])
+            'image_size': image_size
         }
         feature_extractor = FeatureExtractor(feature_config)
         model_trainer = ModelTrainer(self.config if isinstance(self.config, dict) else vars(self.config))
@@ -366,12 +389,14 @@ class NurdlePipeline:
         test_annots = self.data_loader.test_annotations
         y_true = []
         y_pred = []
-        for annot in test_annots:
-            image = self.data_loader.load_image(annot.image_path)
-            features = feature_extractor.extract_image_features(image)
-            pred_count = model_trainer.predict_count(features)
-            y_true.append(annot.nurdle_count)
-            y_pred.append(pred_count)
+        for batch in self.data_loader.get_image_batches(test_annots):
+            self.logger.debug(f"Evaluating batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
+            for annot in batch:
+                image = self.data_loader.load_image(annot.image_path)
+                features = feature_extractor.extract_image_features(image)
+                pred_count = model_trainer.predict_count(features)
+                y_true.append(annot.nurdle_count)
+                y_pred.append(pred_count)
         from sklearn.metrics import mean_absolute_error, mean_squared_error
         mae = mean_absolute_error(y_true, y_pred)
         rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -568,7 +593,7 @@ def parse_arguments():
         '--steps',
         type=str,
         default=None,
-        help='Comma-separated list of stages to run (default: all stages except save). Options: normalization,windows,features,tuning,training,evaluation,save'
+        help='Comma-separated list of stages to run (default: all stages except save). Options: normalization,features,tuning,training,evaluation,save'
     )
     
     parser.add_argument(
