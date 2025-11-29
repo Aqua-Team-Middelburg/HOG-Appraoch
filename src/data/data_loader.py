@@ -2,7 +2,7 @@
 Data loading and management for single-stage SVM nurdle count prediction pipeline.
 
 This module handles:
-- Loading image annotations from JSON files
+- Loading images and deriving counts from filename convention
 - Image normalization and preprocessing
 - Train/test dataset splitting
 - Memory-efficient batch processing
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Iterator
 from dataclasses import dataclass
 import logging
+from collections import defaultdict
 
 
 @dataclass
@@ -23,7 +24,7 @@ class ImageAnnotation:
     def __init__(self, image_path: str, nurdle_count: int, image_id: str):
         self.image_path = image_path
         self.nurdle_count = nurdle_count
-        self.image_id = image_id
+        self.image_id = image_id  # derived from filename stem
 
 
 class DataLoader:
@@ -42,50 +43,44 @@ class DataLoader:
         self.train_test_ratio = config.get('train_test_ratio', 0.8)
         self.target_resolution = config.get('target_resolution', 1080)
         self.batch_size = config.get('batch_size', 15)
+        self.count_bins = config.get('count_bins', [0, 10, 30, 10**9])
         
         # Data storage
         self.annotations: List[ImageAnnotation] = []
         self.train_annotations: List[ImageAnnotation] = []
         self.test_annotations: List[ImageAnnotation] = []
         
+    def _parse_count_from_filename(self, stem: str) -> int:
+        """Extract count from filename stem (expects leading integer before underscore)."""
+        try:
+            first_token = stem.split('_')[0]
+            return int(first_token)
+        except Exception:
+            return None
+
     def load_annotations(self, input_dir: str) -> None:
         """
-        Load image annotations from JSON files for count prediction.
+        Load images and derive counts from filename convention: <count>_<anything>.ext
         Args:
-            input_dir: Directory containing images and JSON annotation files
+            input_dir: Directory containing images
         """
-        self.logger.info(f"Loading annotations from {input_dir}")
+        self.logger.info(f"Loading images from {input_dir} using filename counts")
         input_path = Path(input_dir)
-        for json_file in input_path.glob("*.json"):
-            try:
-                with open(json_file, 'r') as f:
-                    data = json.load(f)
-                image_id = json_file.stem
-                image_path = str(json_file.with_suffix('.jpg'))
-                if not Path(image_path).exists():
-                    for ext in ['.png', '.jpeg', '.tiff']:
-                        alt_path = str(json_file.with_suffix(ext))
-                        if Path(alt_path).exists():
-                            image_path = alt_path
-                            break
-                if not Path(image_path).exists():
-                    self.logger.warning(f"Image file not found for {json_file}")
-                    continue
-                # Count nurdles from annotation file
-                nurdle_count = 0
-                if 'objects' in data:
-                    nurdle_count = len(data['objects'])
-                elif 'nurdles' in data:
-                    nurdle_count = len(data['nurdles'])
-                annotation = ImageAnnotation(
-                    image_path=image_path,
-                    nurdle_count=nurdle_count,
-                    image_id=image_id
-                )
-                self.annotations.append(annotation)
-            except Exception as e:
-                self.logger.error(f"Error loading annotation {json_file}: {e}")
-        self.logger.info(f"Loaded {len(self.annotations)} annotations")
+        supported_exts = {'.jpg', '.jpeg', '.png', '.tiff', '.bmp'}
+        for img_file in input_path.iterdir():
+            if img_file.suffix.lower() not in supported_exts:
+                continue
+            count = self._parse_count_from_filename(img_file.stem)
+            if count is None:
+                self.logger.warning(f"Could not parse count from filename: {img_file.name}")
+                continue
+            annotation = ImageAnnotation(
+                image_path=str(img_file),
+                nurdle_count=count,
+                image_id=img_file.stem
+            )
+            self.annotations.append(annotation)
+        self.logger.info(f"Loaded {len(self.annotations)} annotations from filenames")
     
 
     
@@ -112,23 +107,34 @@ class DataLoader:
         return image
     
     def split_train_test(self) -> None:
-        """Split annotations into training and test sets."""
+        """Split annotations into training and test sets with stratification by count bins."""
         if not self.annotations:
             raise ValueError("No annotations loaded. Call load_annotations() first.")
-            
-        train_size = int(len(self.annotations) * self.train_test_ratio)
-        
-        # Shuffle annotations for random split
-        np.random.seed(42)  # For reproducibility
-        indices = np.random.permutation(len(self.annotations))
-        
-        train_indices = indices[:train_size]
-        test_indices = indices[train_size:]
-        
+
+        # Bin counts for stratification
+        def bin_label(count: int) -> int:
+            return int(np.digitize(count, self.count_bins, right=True))
+
+        bins_to_indices: Dict[int, List[int]] = defaultdict(list)
+        for idx, ann in enumerate(self.annotations):
+            bins_to_indices[bin_label(ann.nurdle_count)].append(idx)
+
+        train_indices: List[int] = []
+        test_indices: List[int] = []
+        rng = np.random.default_rng(42)
+        for _, idxs in bins_to_indices.items():
+            idxs = np.array(idxs)
+            rng.shuffle(idxs)
+            cut = int(len(idxs) * self.train_test_ratio)
+            train_indices.extend(idxs[:cut].tolist())
+            test_indices.extend(idxs[cut:].tolist())
+
         self.train_annotations = [self.annotations[i] for i in train_indices]
         self.test_annotations = [self.annotations[i] for i in test_indices]
         
-        self.logger.info(f"Split: {len(self.train_annotations)} training, {len(self.test_annotations)} test images")
+        self.logger.info(
+            f"Split (stratified): {len(self.train_annotations)} training, {len(self.test_annotations)} test images"
+        )
     
     def get_image_batches(self, annotations: List[ImageAnnotation]) -> Iterator[List[ImageAnnotation]]:
         """

@@ -17,6 +17,8 @@ data:
   input_dir: "input"              # Input directory with images and JSON files
   output_dir: "output"            # Output directory for results
   save_dir: "saved_outputs"       # Directory to save zipped output folders (set to null to disable)
+  count_bins: [0, 10, 30, 1000000000]  # Stratification bins for counts (adjust to dataset)
+  cv_folds: 5                    # Folds for stratified CV (reduce if data is very small)
 
 # Feature Extraction Configuration  
 features:

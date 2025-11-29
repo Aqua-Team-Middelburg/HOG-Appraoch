@@ -183,3 +183,17 @@ frontend/
 
 #copilot instructions
 .github/copilot-instructions/
+
+#logs folder
+logs/
+logs/*
+
+#lbp history files
+lbp_hist/
+scripts/
+
+#postfolio stuff
+Portfolio/
+Assessment Form.html
+Portfolio Restructure Plan.html
+README_TEST_PLAN.md

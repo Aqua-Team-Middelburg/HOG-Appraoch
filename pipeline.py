@@ -10,6 +10,9 @@ from datetime import datetime
 import numpy as np
 import os
 import threading
+from sklearn.model_selection import StratifiedKFold, KFold
+from sklearn.svm import SVR
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # Import pipeline components
 try:
@@ -17,7 +20,6 @@ try:
     from src.data import DataLoader
     from src.features import FeatureExtractor
     from src.models import ModelTrainer
-    from src.evaluation import ModelEvaluator
 except ImportError as e:
     print(f"Error importing pipeline components: {e}")
     print("Make sure all src modules are properly installed")
@@ -77,6 +79,39 @@ class NurdlePipeline:
             return tuple(feature_size)
         target_res = self.config.data.get('target_resolution', 1080)
         return (target_res, target_res)
+
+    def _get_count_bins(self) -> List[float]:
+        """Count bin edges for stratification."""
+        return self.config.data.get('count_bins', [0, 10, 30, 10**9])
+
+    def _bin_labels(self, counts: np.ndarray) -> np.ndarray:
+        edges = self._get_count_bins()
+        return np.digitize(counts, edges, right=True)
+    
+    def _get_cv_splitter(self, strata: np.ndarray):
+        """Return a CV splitter; prefer stratified if class sizes allow."""
+        desired_folds = self.config.data.get('cv_folds', 5)
+        bincount = np.bincount(strata) if len(strata) else np.array([0])
+        min_class = np.min(bincount[bincount > 0]) if np.any(bincount > 0) else 0
+        if min_class >= max(2, desired_folds):
+            return StratifiedKFold(n_splits=desired_folds, shuffle=True, random_state=42)
+        # Fallback: non-stratified KFold with safe n_splits
+        n_splits = min(max(2, min_class if min_class > 0 else desired_folds), len(strata))
+        if n_splits < 2:
+            n_splits = min(2, len(strata)) if len(strata) >= 2 else 1
+        return KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    def _build_features_from_indices(self, annotations: List[Any], indices: np.ndarray, feature_extractor) -> Tuple[np.ndarray, np.ndarray]:
+        """Build feature matrix and target vector for a subset of annotations."""
+        feats = []
+        targets = []
+        for idx in indices:
+            ann = annotations[idx]
+            image = self.data_loader.load_image(ann.image_path)
+            fvec = feature_extractor.extract_image_features(image)
+            feats.append(fvec)
+            targets.append(ann.nurdle_count)
+        return np.array(feats), np.array(targets)
     
     def _setup_logging(self):
         """Setup pipeline-specific logging."""
@@ -293,19 +328,83 @@ class NurdlePipeline:
             'image_size': image_size
         }
         self.feature_extractor = FeatureExtractor(feature_config)
-        training_data: List[Tuple[np.ndarray, int]] = []
-        for batch in self.data_loader.get_image_batches(self.data_loader.train_annotations):
-            self.logger.debug(f"Tuning: processing batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
-            batch_pairs = list(self.feature_extractor.generate_training_data(
-                batch, self.data_loader.load_image))
-            training_data.extend(batch_pairs)
+        train_annotations = self.data_loader.train_annotations
+        y_all = np.array([ann.nurdle_count for ann in train_annotations])
+        strata = self._bin_labels(y_all)
+
         config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
         tuner = OptunaTuner(config_dict)
-        def trainer_func(params):
-            trainer = ModelTrainer({**config_dict, **params})
-            return trainer.train_count_regressor(training_data)
-        tuning_results = tuner.optimize(trainer_func, str(output_dir))
+
+        def cv_objective(params: Dict[str, Any]) -> float:
+            splitter = self._get_cv_splitter(strata)
+            fold_mae = []
+            for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
+                                                    strata if isinstance(splitter, StratifiedKFold) else None):
+                X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
+                X_val, y_val = self._build_features_from_indices(train_annotations, val_idx, self.feature_extractor)
+                y_tr_log = np.log1p(y_tr)
+                reg = SVR(
+                    C=params.get('svr_c', 1.0),
+                    kernel=params.get('svr_kernel', 'rbf'),
+                    gamma=params.get('svr_gamma', 'scale'),
+                    epsilon=params.get('svr_epsilon', 0.1)
+                )
+                reg.fit(X_tr, y_tr_log)
+                preds_log = reg.predict(X_val)
+                # cap to avoid overflow in expm1
+                max_log = np.log1p(np.max(y_tr)) + 2.0
+                preds_log = np.clip(preds_log, a_min=None, a_max=max_log)
+                preds = np.expm1(preds_log)
+                preds = np.nan_to_num(preds, nan=1e6, posinf=1e6, neginf=0)
+                mae_val = mean_absolute_error(y_val, preds)
+                if not np.isfinite(mae_val):
+                    mae_val = 1e6
+                fold_mae.append(mae_val)
+            return float(np.mean(fold_mae))
+
+        tuning_results = tuner.optimize(cv_objective, str(output_dir))
         best_params = tuning_results.get('best_params', {})
+
+        # Calculate best params CV mean/std for reporting
+        if best_params:
+            splitter_final = self._get_cv_splitter(strata)
+            fold_mae = []
+            fold_mape = []
+            for train_idx, val_idx in splitter_final.split(np.arange(len(train_annotations)),
+                                                           strata if isinstance(splitter_final, StratifiedKFold) else None):
+                X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
+                X_val, y_val = self._build_features_from_indices(train_annotations, val_idx, self.feature_extractor)
+                y_tr_log = np.log1p(y_tr)
+                reg = SVR(
+                    C=best_params.get('svr_c', 1.0),
+                    kernel=best_params.get('svr_kernel', 'rbf'),
+                    gamma=best_params.get('svr_gamma', 'scale'),
+                    epsilon=best_params.get('svr_epsilon', 0.1)
+                )
+                reg.fit(X_tr, y_tr_log)
+                preds_log = reg.predict(X_val)
+                max_log = np.log1p(np.max(y_tr)) + 2.0
+                preds_log = np.clip(preds_log, a_min=None, a_max=max_log)
+                preds = np.expm1(preds_log)
+                preds = np.nan_to_num(preds, nan=1e6, posinf=1e6, neginf=0)
+                mae_val = mean_absolute_error(y_val, preds)
+                if not np.isfinite(mae_val):
+                    mae_val = 1e6
+                fold_mae.append(mae_val)
+                mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, 1))) * 100
+                if not np.isfinite(mape_val):
+                    mape_val = 1e6
+                fold_mape.append(mape_val)
+            cv_summary = {
+                'cv_mae_mean': float(np.mean(fold_mae)),
+                'cv_mae_std': float(np.std(fold_mae)),
+                'cv_mape_mean': float(np.mean(fold_mape)),
+                'cv_mape_std': float(np.std(fold_mape)),
+            }
+            with open(output_dir / 'cv_summary.json', 'w') as f:
+                json.dump(cv_summary, f, indent=2)
+            with open(output_dir / 'best_params.json', 'w') as f:
+                json.dump(best_params, f, indent=2)
         return {
             'best_params': best_params,
             'best_mae': tuning_results.get('best_value'),
@@ -337,15 +436,60 @@ class NurdlePipeline:
             'image_size': image_size
         }
         self.feature_extractor = FeatureExtractor(feature_config)
-        training_data: List[Tuple[np.ndarray, int]] = []
-        for batch in self.data_loader.get_image_batches(self.data_loader.train_annotations):
-            self.logger.debug(f"Training: processing batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
-            batch_pairs = list(self.feature_extractor.generate_training_data(
-                batch, self.data_loader.load_image))
-            training_data.extend(batch_pairs)
+        # Load best params from tuning if available
+        tuning_best_path = self.output_dirs['tuning'] / 'best_params.json'
         config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
+        if tuning_best_path.exists():
+            with open(tuning_best_path, 'r') as f:
+                best_params = json.load(f)
+            config_dict = {**config_dict, **best_params}
+            self.logger.info(f"Using tuned params: {best_params}")
+
+        # Compute CV metrics with selected params
+        train_annotations = self.data_loader.train_annotations
+        y_all = np.array([ann.nurdle_count for ann in train_annotations])
+        strata = self._bin_labels(y_all)
+        splitter = self._get_cv_splitter(strata)
+        fold_mae = []
+        fold_mape = []
+        for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
+                                                 strata if isinstance(splitter, StratifiedKFold) else None):
+            X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
+            X_val, y_val = self._build_features_from_indices(train_annotations, val_idx, self.feature_extractor)
+            y_tr_log = np.log1p(y_tr)
+            reg = SVR(
+                C=config_dict.get('svr_c', 1.0),
+                kernel=config_dict.get('svr_kernel', 'rbf'),
+                gamma=config_dict.get('svr_gamma', 'scale'),
+                epsilon=config_dict.get('svr_epsilon', 0.1)
+            )
+            reg.fit(X_tr, y_tr_log)
+            preds_log = reg.predict(X_val)
+            max_log = np.log1p(np.max(y_tr)) + 2.0
+            preds_log = np.clip(preds_log, a_min=None, a_max=max_log)
+            preds = np.expm1(preds_log)
+            preds = np.nan_to_num(preds, nan=1e6, posinf=1e6, neginf=0)
+            mae_val = mean_absolute_error(y_val, preds)
+            if not np.isfinite(mae_val):
+                mae_val = 1e6
+            fold_mae.append(mae_val)
+            mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, 1))) * 100
+            if not np.isfinite(mape_val):
+                mape_val = 1e6
+            fold_mape.append(mape_val)
+        cv_metrics = {
+            'cv_mae_mean': float(np.mean(fold_mae)),
+            'cv_mae_std': float(np.std(fold_mae)),
+            'cv_mape_mean': float(np.mean(fold_mape)),
+            'cv_mape_std': float(np.std(fold_mape)),
+        }
+
+        # Fit final model on full training set (build once)
+        full_features, full_counts = self._build_features_from_indices(train_annotations, np.arange(len(train_annotations)), self.feature_extractor)
+        training_data = list(zip(full_features, full_counts))
         self.model_trainer = ModelTrainer(config_dict)
         training_metrics = self.model_trainer.train_count_regressor(training_data)
+        training_metrics.update(cv_metrics)
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self.model_trainer.save_model(str(self.models_dir))
         metrics_path = output_dir / 'training_metrics.json'
@@ -385,7 +529,6 @@ class NurdlePipeline:
         feature_extractor = FeatureExtractor(feature_config)
         model_trainer = ModelTrainer(self.config if isinstance(self.config, dict) else vars(self.config))
         model_trainer.load_model(str(self.models_dir))
-        self.evaluator = ModelEvaluator()
         test_annots = self.data_loader.test_annotations
         y_true = []
         y_pred = []
@@ -437,6 +580,44 @@ class NurdlePipeline:
             plt.tight_layout()
             plt.savefig(output_dir / 'train_vs_test_metrics.png')
             plt.close()
+            # Baseline vs model
+            train_counts = [ann.nurdle_count for ann in self.data_loader.train_annotations]
+            baseline_pred = float(np.mean(train_counts)) if train_counts else 0.0
+            baseline_mae = mean_absolute_error(y_true, [baseline_pred] * len(y_true))
+            baseline_mape = np.mean(np.abs((np.array(y_true) - baseline_pred) / np.maximum(np.array(y_true), 1))) * 100
+            baseline_metrics = {
+                'baseline_pred': baseline_pred,
+                'baseline_mae': float(baseline_mae),
+                'baseline_mape': float(baseline_mape)
+            }
+            with open(output_dir / 'baseline_metrics.json', 'w') as f:
+                json.dump(baseline_metrics, f, indent=2)
+            plt.figure(figsize=(6, 4))
+            plt.bar(['Baseline MAE', 'SVR MAE'], [baseline_mae, eval_metrics['mae']], color=['gray', 'steelblue'])
+            plt.title('Baseline vs SVR (MAE)')
+            plt.tight_layout()
+            plt.savefig(output_dir / 'baseline_vs_svr.png')
+            plt.close()
+            # CV summary if available
+            if all(k in training_metrics for k in ['cv_mae_mean', 'cv_mae_std']):
+                cv_vals = [training_metrics['cv_mae_mean'], training_metrics['cv_mape_mean']]
+                cv_std = [training_metrics.get('cv_mae_std', 0), training_metrics.get('cv_mape_std', 0)]
+                plt.figure(figsize=(6, 4))
+                plt.bar(['CV MAE', 'CV MAPE'], cv_vals, yerr=cv_std, color='seagreen', alpha=0.8)
+                plt.title('Cross-Validation Metrics (mean ± std)')
+                plt.tight_layout()
+                plt.savefig(output_dir / 'cv_metrics.png')
+                plt.close()
+        # Residuals plot
+        residuals = np.array(y_true) - np.array(y_pred)
+        plt.figure(figsize=(6, 4))
+        plt.hist(residuals, bins=15, color='slateblue', alpha=0.8)
+        plt.title('Residuals (Actual - Predicted)')
+        plt.xlabel('Residual')
+        plt.ylabel('Frequency')
+        plt.tight_layout()
+        plt.savefig(output_dir / 'residuals_hist.png')
+        plt.close()
         # Individual test image visualizations
         for ann, pred_count in zip(test_annots, y_pred):
             img = self.data_loader.load_image(ann.image_path)
