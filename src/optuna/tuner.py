@@ -10,26 +10,20 @@ import optuna
 import numpy as np
 import logging
 from pathlib import Path
-from typing import Dict, Any, Callable, Tuple, List
+from typing import Dict, Any, Callable, Tuple
 import joblib
 import json
-from datetime import datetime
 from tqdm import tqdm
 from contextlib import contextmanager
 import math
 
-# Visualization imports (with fallback)
+# Visualization imports (matplotlib-only to avoid lingering kaleido/browser threads)
 try:
     from optuna.visualization import plot_optimization_history, plot_param_importances, plot_slice
-    try:
-        import plotly.graph_objects as go
-        PLOTLY_AVAILABLE = True
-    except ImportError:
-        PLOTLY_AVAILABLE = False
     VISUALIZATION_AVAILABLE = True
 except ImportError:
     VISUALIZATION_AVAILABLE = False
-    PLOTLY_AVAILABLE = False
+PLOTLY_AVAILABLE = False  # force disable plotly/kaleido
 
 
 class OptunaTuner:
@@ -45,8 +39,8 @@ class OptunaTuner:
         self.logger = logger or logging.getLogger(__name__)
         
         # Optuna configuration
-        # n_trials configured per optimization type (svm_optimization, svr_optimization)
-        # direction and metric are hardcoded per optimization (maximize f1, minimize error)
+        # n_trials configured per optimization type (svr)
+        # direction and metric are hardcoded per optimization (minimize error)
         
         # Storage for best parameters
         self.best_params = None
@@ -125,17 +119,49 @@ class OptunaTuner:
             pruner=optuna.pruners.MedianPruner()
         )
         trial_results = {}
+        # Bounds from config
+        opt_cfg = self.config.get('optimization', {}) if isinstance(self.config, dict) else {}
+        svr_cfg = opt_cfg.get('svr', {})
+        c_min = svr_cfg.get('c_min', 0.1)
+        c_max = svr_cfg.get('c_max', 10.0)
+        eps_min = svr_cfg.get('eps_min', 0.01)
+        eps_max = svr_cfg.get('eps_max', 0.5)
+        kernel_choices = svr_cfg.get('kernel', ['rbf'])
+        if isinstance(kernel_choices, str):
+            kernel_choices = [kernel_choices]
+        gamma_min = svr_cfg.get('gamma_min')
+        gamma_max = svr_cfg.get('gamma_max')
+        gamma_spec = svr_cfg.get('gamma', ['scale'])
+        if isinstance(gamma_spec, str):
+            gamma_choices = [gamma_spec]
+        elif isinstance(gamma_spec, (list, tuple)):
+            gamma_choices = list(gamma_spec)
+        else:
+            gamma_choices = None
+        n_trials = svr_cfg.get('n_trials', 10)
+
         def objective(trial):
             params = {
-                'svr_c': trial.suggest_float('svr_c', 0.001, 100.0, log=True),
-                'svr_kernel': trial.suggest_categorical('svr_kernel', ['linear', 'rbf']),
-                'svr_epsilon': trial.suggest_float('svr_epsilon', 0.01, 1.0)
+                'svr_c': trial.suggest_float('svr_c', c_min, c_max, log=True),
+                'svr_kernel': trial.suggest_categorical('svr_kernel', kernel_choices),
+                'svr_epsilon': trial.suggest_float('svr_epsilon', eps_min, eps_max)
             }
             if params['svr_kernel'] == 'rbf':
-                params['svr_gamma'] = trial.suggest_float('svr_gamma', 0.001, 1.0, log=True)
+                if gamma_min is not None and gamma_max is not None:
+                    params['svr_gamma'] = trial.suggest_float('svr_gamma', gamma_min, gamma_max, log=True)
+                elif gamma_choices:
+                    params['svr_gamma'] = trial.suggest_categorical('svr_gamma', gamma_choices)
+                else:
+                    params['svr_gamma'] = 'scale'
             try:
                 metrics = pipeline_trainer_func(params)
-                mae = float(metrics.get('mae', np.inf))
+                if isinstance(metrics, (int, float, np.number)):
+                    mae = float(metrics)
+                    metrics = {'mae': mae}
+                elif isinstance(metrics, dict):
+                    mae = float(metrics.get('mae', np.inf))
+                else:
+                    raise ValueError("Pipeline trainer must return a dict with 'mae' or a numeric MAE.")
                 if not np.isfinite(mae) or mae <= 0 or mae > 1e6:
                     raise optuna.exceptions.TrialPruned("Non-finite or implausible MAE")
                 trial_results[trial.number] = {'params': params, 'metrics': metrics}
@@ -143,7 +169,6 @@ class OptunaTuner:
             except Exception as e:
                 trial_results[trial.number] = {'params': params, 'metrics': {'mae': 1e6, 'error': str(e)}}
                 return 1e6
-        n_trials = self.config.get('svr_optimization', {}).get('n_trials', 10)
         with self._suppress_optuna_logging():
             with tqdm(total=n_trials, desc="SVR Optimization", unit="trial") as pbar:
                 def callback(study, trial):
@@ -196,106 +221,6 @@ class OptunaTuner:
         self.study = study
         return results_json
     
-    # Removed optimize_svm_only, optimize_svr_only, optimize_sequential (legacy, not used in single-stage pipeline)
-    
-    def optimize_svr_only(self,
-                         pipeline_trainer_func: Callable,
-                         output_dir: str,
-                         fixed_svm_params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Optimize SVR regressor parameters on coordinate error (minimize).
-        
-        Uses fixed SVM parameters from previous optimization.
-        
-        Args:
-            pipeline_trainer_func: Function that trains pipeline and returns metrics
-            output_dir: Directory to save optimization results
-            fixed_svm_params: Best SVM parameters from step 1
-            
-        Returns:
-            Best SVR parameters (combined with SVM params)
-        """
-        self.logger.info("=" * 60)
-        self.logger.info("OPTIMIZING SVR REGRESSOR (Step 2/2)")
-        self.logger.info("=" * 60)
-        
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Create study for minimization
-        study = optuna.create_study(
-            direction='minimize',
-            study_name='svr_optimization',
-            pruner=optuna.pruners.MedianPruner()
-        )
-        
-        def objective(trial):
-            # Use fixed SVM parameters
-            params = fixed_svm_params.copy()
-            
-            # Sample SVR parameters
-            params.update({
-                'svr_c': trial.suggest_float('svr_c', 0.001, 100.0, log=True),
-                'svr_kernel': trial.suggest_categorical('svr_kernel', ['linear', 'rbf']),
-                'svr_epsilon': trial.suggest_float('svr_epsilon', 0.01, 1.0),
-            })
-            
-            if params['svr_kernel'] == 'rbf':
-                params['svr_gamma'] = trial.suggest_float('svr_gamma', 0.001, 1.0, log=True)
-            
-            try:
-                metrics = pipeline_trainer_func(params)
-                return metrics['avg_coordinate_error']
-            except Exception as e:
-                self.logger.error(f"Trial failed: {e}")
-                return 1000.0  # Large error for failed trials
-        
-        # Run optimization with progress bar
-        n_trials = self.config.get('svr_optimization', {}).get('n_trials', 10)
-        
-        with self._suppress_optuna_logging():
-            with tqdm(total=n_trials, desc="SVR Optimization", unit="trial") as pbar:
-                def callback(study, trial):
-                    pbar.update(1)
-                    pbar.set_postfix({"best_error": f"{study.best_value:.2f}px"})
-            
-                study.optimize(objective, n_trials=n_trials, callbacks=[callback], show_progress_bar=False)
-        
-        best_svr_params = study.best_params
-        self.logger.info(f"Best SVR Coordinate Error: {study.best_value:.2f} pixels")
-        self.logger.info(f"Best SVR parameters: {best_svr_params}")
-        
-        # Combine with SVM params
-        best_combined_params = {**fixed_svm_params, **best_svr_params}
-        
-        # Save results
-        self._save_optimization_results(study, output_path / "svr_optimization")
-        
-        return best_combined_params
-    
-    def optimize_sequential(self,
-                           pipeline_trainer_func: Callable,
-                           output_dir: str) -> Dict[str, Any]:
-        """
-        Run sequential optimization: SVM first, then SVR.
-        
-        This is the main entry point for optimization.
-        
-        Args:
-            pipeline_trainer_func: Function that trains pipeline and returns metrics
-            output_dir: Directory to save optimization results
-            
-        Returns:
-            Best parameters for both SVM and SVR
-        """
-        self.logger.info("=" * 60)
-        self.logger.info("STARTING SEQUENTIAL HYPERPARAMETER OPTIMIZATION")
-        self.logger.info("=" * 60)
-        
-        # Step 1: Optimize SVM
-        self.logger.warning("Sequential optimization is deprecated in single-stage pipeline.")
-        return {}
-    
     def _save_optimization_results(self, study, output_path: Path):
         """Save optimization results and visualizations for a single study."""
         try:
@@ -307,95 +232,55 @@ class OptunaTuner:
             
             # Do not save best_params.json (all info is in tuning_results.json)
             
-            # Generate visualizations (PNG only)
-            if VISUALIZATION_AVAILABLE and PLOTLY_AVAILABLE:
+            # Generate visualizations (PNG, matplotlib only to avoid kaleido threads)
+            if VISUALIZATION_AVAILABLE:
                 try:
-                    with self._suppress_plot_logging():
-                        # Optimization history
-                        fig_history = plot_optimization_history(study)
-                        fig_history.update_yaxes(type="log", title_text="Objective (MAE, log scale)")
-                        fig_history.write_image(str(output_path / "optimization_history.png"))
-                        self.logger.info("Saved optimization history plot")
-                        
-                        # Parameter importances
-                        if len(study.trials) > 1:
-                            fig_importance = plot_param_importances(study)
-                            fig_importance.write_image(str(output_path / "param_importances.png"))
-                            self.logger.info("Saved parameter importances plot")
-                        
-                        # Slice plot (parameter relationships)
-                        if len(study.trials) > 1:
-                            fig_slice = plot_slice(study)
-                            fig_slice.update_yaxes(type="log", title_text="Objective (MAE, log scale)")
-                            fig_slice.write_image(str(output_path / "param_slice.png"))
-                            self.logger.info("Saved parameter slice plot")
-                    
-                except Exception as viz_error:
-                    self.logger.warning(f"Could not generate visualizations with plotly: {viz_error}")
-                    # Fallback to matplotlib-based visualizations to ensure files exist
-                    try:
-                        from optuna.visualization.matplotlib import (
-                            plot_optimization_history as mpl_plot_history,
-                            plot_param_importances as mpl_plot_importances,
-                            plot_slice as mpl_plot_slice,
-                        )
-                        import matplotlib.pyplot as plt
-                        import numpy as np
+                    from optuna.visualization.matplotlib import (
+                        plot_optimization_history as mpl_plot_history,
+                        plot_param_importances as mpl_plot_importances,
+                        plot_slice as mpl_plot_slice,
+                    )
+                    import matplotlib.pyplot as plt
+                    import numpy as np
 
-                        def _save_mpl(obj, path: Path, ylog: bool = False):
-                            fig = None
-                            axes = None
-                            if hasattr(obj, "get_figure"):
-                                fig = obj.get_figure()
-                                axes = obj
-                            elif hasattr(obj, "figure"):
-                                fig = obj.figure
-                                axes = obj
-                            elif isinstance(obj, (list, tuple, np.ndarray)) and len(obj) > 0:
-                                first = obj[0]
-                                if hasattr(first, "get_figure"):
-                                    fig = first.get_figure()
-                                    axes = first
-                                elif hasattr(first, "figure"):
-                                    fig = first.figure
-                                    axes = first
-                            if fig is None:
-                                raise RuntimeError("Could not resolve matplotlib figure from object")
-                            if ylog and axes is not None:
-                                axes.set_yscale("log")
-                                axes.set_ylabel("Objective (MAE, log scale)")
-                            fig.savefig(path, bbox_inches="tight", dpi=150)
-                            plt.close(fig)
+                    def _save_mpl(obj, path: Path, ylog: bool = False):
+                        fig = None
+                        axes = None
+                        if hasattr(obj, "get_figure"):
+                            fig = obj.get_figure()
+                            axes = obj
+                        elif hasattr(obj, "figure"):
+                            fig = obj.figure
+                            axes = obj
+                        elif isinstance(obj, (list, tuple, np.ndarray)) and len(obj) > 0:
+                            first = obj[0]
+                            if hasattr(first, "get_figure"):
+                                fig = first.get_figure()
+                                axes = first
+                            elif hasattr(first, "figure"):
+                                fig = first.figure
+                                axes = first
+                        if fig is None:
+                            raise RuntimeError("Could not resolve matplotlib figure from object")
+                        if ylog and axes is not None:
+                            axes.set_yscale("log")
+                            axes.set_ylabel("Objective (MAE, log scale)")
+                        fig.savefig(path, bbox_inches="tight", dpi=150)
+                        plt.close(fig)
 
-                        _save_mpl(mpl_plot_history(study), output_path / "optimization_history.png", ylog=True)
+                    _save_mpl(mpl_plot_history(study), output_path / "optimization_history.png", ylog=True)
 
-                        if len(study.trials) > 1:
-                            _save_mpl(mpl_plot_importances(study), output_path / "param_importances.png")
+                    if len(study.trials) > 1:
+                        _save_mpl(mpl_plot_importances(study), output_path / "param_importances.png")
 
-                        if len(study.trials) > 1:
-                            _save_mpl(mpl_plot_slice(study), output_path / "param_slice.png", ylog=True)
-                        self.logger.info("Saved optimization plots using matplotlib fallback")
-                    except Exception as fallback_error:
-                        self.logger.warning(f"Could not generate matplotlib visualizations: {fallback_error}")
+                    if len(study.trials) > 1:
+                        _save_mpl(mpl_plot_slice(study), output_path / "param_slice.png", ylog=True)
+                    self.logger.info("Saved optimization plots using matplotlib fallback")
+                except Exception as fallback_error:
+                    self.logger.warning(f"Could not generate matplotlib visualizations: {fallback_error}")
             else:
                 self.logger.warning("Optuna visualization libraries not available, skipping plots")
             
             self.logger.info(f"Saved optimization results to {output_path}")
         except Exception as e:
             self.logger.error(f"Error saving optimization results: {e}")
-    
-    # Removed create_training_callback (legacy, not used in single-stage pipeline)
-    
-    def load_best_parameters(self, output_dir: str) -> Dict[str, Any]:
-        """Load previously optimized parameters."""
-        best_params_path = Path(output_dir) / "best_parameters.json"
-        
-        if best_params_path.exists():
-            with open(best_params_path, 'r') as f:
-                data = json.load(f)
-                self.best_params = data['best_params']
-                self.best_value = data['best_value']
-                self.logger.info(f"Loaded best parameters from {best_params_path}")
-                return self.best_params
-        else:
-            raise FileNotFoundError(f"No optimization results found at {best_params_path}")
