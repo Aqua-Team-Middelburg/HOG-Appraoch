@@ -802,9 +802,17 @@ class NurdlePipeline:
             }
             with open(output_dir / 'baseline_metrics.json', 'w') as f:
                 json.dump(baseline_metrics, f, indent=2)
-            plt.figure(figsize=(6, 4))
-            plt.bar(['Baseline MAE', 'SVR MAE'], [baseline_mae, eval_metrics['mae']], color=['gray', 'steelblue'])
-            plt.title('Baseline vs SVR (MAE)')
+            # Scatter of true vs predicted with ideal y=x reference
+            plt.figure(figsize=(6, 6))
+            plt.scatter(y_true, y_pred, alpha=0.7, color='steelblue', label='SVR predictions')
+            xy_min = min(min(y_true), min(y_pred))
+            xy_max = max(max(y_true), max(y_pred))
+            plt.plot([xy_min, xy_max], [xy_min, xy_max], 'k--', label='Ideal (y = x)')
+            plt.xlabel('True Count')
+            plt.ylabel('Predicted Count')
+            plt.title('True vs Predicted Counts')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.savefig(output_dir / 'baseline_vs_svr.png')
             plt.close()

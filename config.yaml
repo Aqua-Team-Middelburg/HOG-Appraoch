@@ -17,13 +17,13 @@ data:
   input_dir: "input"              # Input directory with images and JSON files
   output_dir: "output"            # Output directory for results
   save_dir: "saved_outputs"       # Directory to save zipped output folders (set to null to disable)
-  count_bins: [0, 20, 40, 60, 80, 110, 200, 1000000000]  # Stratification bins for counts (adjust to dataset)
+  count_bins: [0, 20, 40, 60, 80, 110, 150, 220, 1000000000]  # Stratify high-count tail separately
   cv_folds: 5                    # Folds for stratified CV (reduce if data is very small)
 
 # Feature Extraction Configuration  
 features:
   hog_cell_size: [8, 8]           # HOG cell size (image size derived from data.target_resolution)
-  use_hog: true                   # Toggle HOG features (set false for ablation)
+  use_hog: false                  # Disable HOG (LBP-only per ablation)
   use_lbp: true                   # Toggle LBP features (set false for ablation)
 
 # Evaluation Configuration  
@@ -35,13 +35,11 @@ optimization:
   svr:
     n_trials: 20
     c_min: 0.1
-    c_max: 10.0
-    eps_min: 0.01
+    c_max: 3.0                    # Shrink C range to reduce capacity
+    eps_min: 0.05
     eps_max: 0.5
-    kernel: rbf
-    gamma: [scale, auto]          # Categorical options
-    gamma_min: 0.0001             # Optional log-uniform float search lower bound
-    gamma_max: 1.0                # Optional log-uniform float search upper bound
+    kernel: linear                # Simpler kernel to discourage overfitting
+    gamma: scale                  # Ignored for linear kernel; kept for compatibility
     
 # Pipeline Control
 pipeline:
