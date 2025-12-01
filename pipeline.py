@@ -20,7 +20,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 try:
     from src.utils.config import load_config
     from src.data import DataLoader
-    from src.features import FeatureExtractor
+    from src.features import FeatureExtractor, build_nurdle_mask
     from src.models import ModelTrainer
 except ImportError as e:
     print(f"Error importing pipeline components: {e}")
@@ -742,11 +742,19 @@ class NurdlePipeline:
         test_annots = self.data_loader.test_annotations
         y_true = []
         y_pred = []
+        seg_config = self.config.features.get('segmentation', {})
         for batch in self.data_loader.get_image_batches(test_annots):
             self.logger.debug(f"Evaluating batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
             for annot in batch:
                 image = self.data_loader.load_image(annot.image_path)
-                features = feature_extractor.extract_image_features(image)
+                # Test-time preprocessing: restrict HOG/LBP to segmented nurdle regions
+                mask = build_nurdle_mask(
+                    image,
+                    min_dist=seg_config.get('min_dist', 8),
+                    min_area=seg_config.get('min_area', 50),
+                    max_area=seg_config.get('max_area', 2000)
+                )
+                features = feature_extractor.extract_image_features(image, mask=mask)
                 pred_count = model_trainer.predict_count(features)
                 y_true.append(annot.nurdle_count)
                 y_pred.append(pred_count)

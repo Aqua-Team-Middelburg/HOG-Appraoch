@@ -6,7 +6,7 @@ This module provides combined HOG and LBP feature extraction from full images fo
 
 # Required imports
 import logging
-from typing import Dict, Any, List, Iterator, Tuple
+from typing import Dict, Any, List, Iterator, Tuple, Optional
 import numpy as np
 import cv2
 from skimage.feature import hog, local_binary_pattern
@@ -22,11 +22,23 @@ class FeatureExtractor:
         self.use_hog = bool(config.get('use_hog', True))
         self.use_lbp = bool(config.get('use_lbp', True))
 
-    def extract_image_features(self, image: np.ndarray) -> np.ndarray:
+    def _apply_mask(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Apply a binary mask to an image, resizing the mask if needed."""
+        if mask.shape[:2] != image.shape[:2]:
+            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+        mask = (mask > 0).astype(np.uint8) * 255
+        return cv2.bitwise_and(image, image, mask=mask)
+
+    def extract_image_features(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Extract combined RGB HOG (per channel) and grayscale LBP features.
         Image is resized to config.image_size before feature extraction.
+
+        If a mask is provided, HOG/LBP are computed on the masked nurdle regions only.
         """
+        if mask is not None:
+            image = self._apply_mask(image, mask)
+
         if image.shape[:2] != self.image_size:
             image = cv2.resize(image, self.image_size)
 
@@ -67,6 +79,12 @@ class FeatureExtractor:
             raise ValueError("FeatureExtractor: both use_hog and use_lbp are False; no features to extract.")
 
         return np.concatenate(parts)
+
+    def extract_segmented_features(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """
+        Convenience wrapper to emphasize segmented feature extraction intent.
+        """
+        return self.extract_image_features(image, mask=mask)
 
     def extract_features(self, image_path: str) -> np.ndarray:
         """
