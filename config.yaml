@@ -13,7 +13,7 @@ project:
 data:
   train_test_ratio: 0.8           # Fraction for training (0.8 = 80% train, 20% test)
   target_resolution: 1080         # Target image resolution for normalization
-  batch_size: 15                  # Images per RAM batch (memory management)
+  batch_size: 30                  # Images per RAM batch (memory management)
   input_dir: "input"              # Input directory with images and JSON files
   output_dir: "output"            # Output directory for results
   save_dir: "saved_outputs"       # Directory to save zipped output folders (set to null to disable)
@@ -23,7 +23,7 @@ data:
 # Feature Extraction Configuration  
 features:
   hog_cell_size: [8, 8]           # HOG cell size (image size derived from data.target_resolution)
-  use_hog: false                  # Disable HOG (LBP-only per ablation)
+  use_hog: true                  # Disable HOG (LBP-only per ablation)
   use_lbp: true                   # Toggle LBP features (set false for ablation)
 
 # Evaluation Configuration  

@@ -109,7 +109,7 @@ class OptunaTuner:
         
     def optimize(self, pipeline_trainer_func: Callable, output_dir: str = "output/optuna") -> Dict[str, Any]:
         """
-        Run SVR hyperparameter optimization for count prediction (minimize MAE).
+        Run SVR hyperparameter optimization for count prediction (minimize MAPE).
         """
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -156,24 +156,30 @@ class OptunaTuner:
             try:
                 metrics = pipeline_trainer_func(params)
                 if isinstance(metrics, (int, float, np.number)):
-                    mae = float(metrics)
-                    metrics = {'mae': mae}
+                    mape = float(metrics)
+                    metrics = {'mape': mape}
                 elif isinstance(metrics, dict):
-                    mae = float(metrics.get('mae', np.inf))
+                    if 'mape' in metrics:
+                        mape = float(metrics.get('mape', np.inf))
+                    elif 'mae' in metrics:
+                        # Backward compatibility if caller still returns MAE only
+                        mape = float(metrics.get('mae', np.inf))
+                    else:
+                        raise ValueError("Pipeline trainer must return a dict with 'mape' or a numeric MAPE.")
                 else:
-                    raise ValueError("Pipeline trainer must return a dict with 'mae' or a numeric MAE.")
-                if not np.isfinite(mae) or mae <= 0 or mae > 1e6:
-                    raise optuna.exceptions.TrialPruned("Non-finite or implausible MAE")
+                    raise ValueError("Pipeline trainer must return a dict with 'mape' or a numeric MAPE.")
+                if not np.isfinite(mape) or mape < 0 or mape > 1e6:
+                    raise optuna.exceptions.TrialPruned("Non-finite or implausible MAPE")
                 trial_results[trial.number] = {'params': params, 'metrics': metrics}
-                return mae
+                return mape
             except Exception as e:
-                trial_results[trial.number] = {'params': params, 'metrics': {'mae': 1e6, 'error': str(e)}}
+                trial_results[trial.number] = {'params': params, 'metrics': {'mape': 1e6, 'error': str(e)}}
                 return 1e6
         with self._suppress_optuna_logging():
             with tqdm(total=n_trials, desc="SVR Optimization", unit="trial") as pbar:
                 def callback(study, trial):
                     pbar.update(1)
-                    pbar.set_postfix({"best_mae": f"{study.best_value:.2f}"})
+                    pbar.set_postfix({"best_mape": f"{study.best_value:.2f}"})
                 study.optimize(objective, n_trials=n_trials, callbacks=[callback], show_progress_bar=False)
         best_params = study.best_params
         best_trial_idx = None
@@ -203,6 +209,7 @@ class OptunaTuner:
             'best_params': best_params,
             'best_value': float(study.best_value),
             'best_value_log10': math.log10(study.best_value) if study.best_value and study.best_value > 0 else None,
+            'objective': 'mape',
             'n_trials': len(study.trials),
             'trial_results': trial_results,
             'best_trial_idx': best_trial_idx,
@@ -264,7 +271,7 @@ class OptunaTuner:
                             raise RuntimeError("Could not resolve matplotlib figure from object")
                         if ylog and axes is not None:
                             axes.set_yscale("log")
-                            axes.set_ylabel("Objective (MAE, log scale)")
+                            axes.set_ylabel("Objective (MAPE, log scale)")
                         fig.savefig(path, bbox_inches="tight", dpi=150)
                         plt.close(fig)
 

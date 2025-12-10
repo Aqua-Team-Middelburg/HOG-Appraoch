@@ -361,7 +361,9 @@ class NurdlePipeline:
         def cv_objective(params: Dict[str, Any]) -> Dict[str, Any]:
             splitter = self._get_cv_splitter(strata)
             fold_mae = []
+            fold_mape = []
             bnds = self._svr_bounds()
+            denom_floor = 1.0
             for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
                                                     strata if isinstance(splitter, StratifiedKFold) else None):
                 X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
@@ -395,11 +397,17 @@ class NurdlePipeline:
                 preds = np.clip(preds, 0, np.max(y_tr) + 50)
                 preds = np.nan_to_num(preds, nan=1e6, posinf=1e6, neginf=0)
                 mae_val = mean_absolute_error(y_val, preds)
+                mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, denom_floor))) * 100
                 if not np.isfinite(mae_val):
                     mae_val = 1e6
+                if not np.isfinite(mape_val):
+                    mape_val = 1e6
                 fold_mae.append(mae_val)
+                fold_mape.append(mape_val)
             # Return full metrics dict for the tuner (Optuna expects .get access)
             return {
+                'mape': float(np.mean(fold_mape)),
+                'fold_mape': [float(m) for m in fold_mape],
                 'mae': float(np.mean(fold_mae)),
                 'fold_mae': [float(m) for m in fold_mae],
                 'n_folds': len(fold_mae)
@@ -414,6 +422,7 @@ class NurdlePipeline:
             fold_mae = []
             fold_mape = []
             bnds = self._svr_bounds()
+            denom_floor = 1.0
             for train_idx, val_idx in splitter_final.split(np.arange(len(train_annotations)),
                                                            strata if isinstance(splitter_final, StratifiedKFold) else None):
                 X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
@@ -448,11 +457,12 @@ class NurdlePipeline:
                 if not np.isfinite(mae_val):
                     mae_val = 1e6
                 fold_mae.append(mae_val)
-                mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, 1))) * 100
+                mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, denom_floor))) * 100
                 if not np.isfinite(mape_val):
                     mape_val = 1e6
                 fold_mape.append(mape_val)
             cv_summary = {
+                'primary_metric': 'mape',
                 'cv_mae_mean': float(np.mean(fold_mae)),
                 'cv_mae_std': float(np.std(fold_mae)),
                 'cv_mape_mean': float(np.mean(fold_mape)),
@@ -464,7 +474,8 @@ class NurdlePipeline:
                 json.dump(best_params, f, indent=2)
         return {
             'best_params': best_params,
-            'best_mae': tuning_results.get('best_value'),
+            'best_mape': tuning_results.get('best_value'),
+            'best_value': tuning_results.get('best_value'),
             'n_trials': tuning_results.get('n_trials'),
             'output_dir': str(output_dir),
             'tuning_results_path': str(output_dir / 'tuning_results.json'),
@@ -523,6 +534,7 @@ class NurdlePipeline:
             return val if val is not None else 'scale'
         fold_mae = []
         fold_mape = []
+        denom_floor = 1.0
         for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
                                                  strata if isinstance(splitter, StratifiedKFold) else None):
             X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
@@ -548,7 +560,7 @@ class NurdlePipeline:
             if not np.isfinite(mae_val):
                 mae_val = 1e6
             fold_mae.append(mae_val)
-            mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, 1))) * 100
+            mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, denom_floor))) * 100
             if not np.isfinite(mape_val):
                 mape_val = 1e6
             fold_mape.append(mape_val)
@@ -571,9 +583,9 @@ class NurdlePipeline:
         try:
             import matplotlib.pyplot as plt
             plt.figure(figsize=(5, 4))
-            plt.boxplot(fold_mae, vert=True, patch_artist=True, labels=['CV MAE'])
-            plt.ylabel('MAE')
-            plt.title('CV MAE Dispersion')
+            plt.boxplot(fold_mape, vert=True, patch_artist=True, labels=['CV MAPE'])
+            plt.ylabel('MAPE (%)')
+            plt.title('CV MAPE Dispersion')
             plt.tight_layout()
             plt.savefig(output_dir / 'cv_dispersion.png', dpi=150, bbox_inches='tight')
             plt.close()
@@ -592,6 +604,7 @@ class NurdlePipeline:
             def _cv_on_arrays(features_arr, targets_arr, splitter_obj):
                 fold_mae_local = []
                 fold_mape_local = []
+                denom_floor_local = 1.0
                 for tr_idx, va_idx in splitter_obj.split(np.arange(len(targets_arr)),
                                                         self._bin_labels(targets_arr) if isinstance(splitter_obj, StratifiedKFold) else None):
                     X_tr, y_tr = features_arr[tr_idx], targets_arr[tr_idx]
@@ -617,7 +630,7 @@ class NurdlePipeline:
                     if not np.isfinite(mae_local):
                         mae_local = 1e6
                     fold_mae_local.append(mae_local)
-                    mape_local = np.mean(np.abs((y_val - preds_local) / np.maximum(y_val, 1))) * 100
+                    mape_local = np.mean(np.abs((y_val - preds_local) / np.maximum(y_val, denom_floor_local))) * 100
                     if not np.isfinite(mape_local):
                         mape_local = 1e6
                     fold_mape_local.append(mape_local)
@@ -627,6 +640,7 @@ class NurdlePipeline:
                     'cv_mape_mean': float(np.mean(fold_mape_local)),
                     'cv_mape_std': float(np.std(fold_mape_local)),
                     'fold_mae': [float(x) for x in fold_mae_local],
+                    'fold_mape': [float(x) for x in fold_mape_local],
                 }
 
             for label, cfg in ablation_cfgs:
@@ -656,7 +670,7 @@ class NurdlePipeline:
             base_indices = np.arange(len(full_counts))
             rng.shuffle(base_indices)
 
-            def _cv_mae_on_subset(idx_subset):
+            def _cv_mape_on_subset(idx_subset):
                 subset_feats = full_features[idx_subset]
                 subset_counts = full_counts[idx_subset]
                 splitter_subset = self._get_cv_splitter(self._bin_labels(subset_counts))
@@ -666,7 +680,7 @@ class NurdlePipeline:
             for frac in fractions:
                 n = max(2, int(len(base_indices) * frac))
                 idx_subset = base_indices[:n]
-                stats = _cv_mae_on_subset(idx_subset)
+                stats = _cv_mape_on_subset(idx_subset)
                 learning_curve.append({
                     'fraction': frac,
                     'n_samples': int(n),
@@ -679,14 +693,14 @@ class NurdlePipeline:
                     plt.figure(figsize=(6, 4))
                     plt.errorbar(
                         [p['fraction'] for p in learning_curve],
-                        [p['cv_mae_mean'] for p in learning_curve],
-                        yerr=[p['cv_mae_std'] for p in learning_curve],
+                        [p['cv_mape_mean'] for p in learning_curve],
+                        yerr=[p.get('cv_mape_std', 0) for p in learning_curve],
                         fmt='-o',
                         capsize=4
                     )
                     plt.xlabel('Training Fraction')
-                    plt.ylabel('CV MAE')
-                    plt.title('Learning Curve (MAE)')
+                    plt.ylabel('CV MAPE (%)')
+                    plt.title('Learning Curve (MAPE)')
                     plt.grid(True, alpha=0.3)
                     plt.tight_layout()
                     plt.savefig(output_dir / 'learning_curve.png', dpi=150, bbox_inches='tight')
@@ -817,12 +831,18 @@ class NurdlePipeline:
             plt.savefig(output_dir / 'baseline_vs_svr.png')
             plt.close()
             # CV summary if available
-            if all(k in training_metrics for k in ['cv_mae_mean', 'cv_mae_std']):
-                cv_vals = [training_metrics['cv_mae_mean'], training_metrics['cv_mape_mean']]
-                cv_std = [training_metrics.get('cv_mae_std', 0), training_metrics.get('cv_mape_std', 0)]
+            if all(k in training_metrics for k in ['cv_mape_mean', 'cv_mape_std']):
+                labels = ['CV MAPE']
+                cv_vals = [training_metrics['cv_mape_mean']]
+                cv_std = [training_metrics.get('cv_mape_std', 0)]
+                if all(k in training_metrics for k in ['cv_mae_mean', 'cv_mae_std']):
+                    labels.append('CV MAE')
+                    cv_vals.append(training_metrics['cv_mae_mean'])
+                    cv_std.append(training_metrics.get('cv_mae_std', 0))
                 plt.figure(figsize=(6, 4))
-                plt.bar(['CV MAE', 'CV MAPE'], cv_vals, yerr=cv_std, color='seagreen', alpha=0.8)
-                plt.title('Cross-Validation Metrics (mean ± std)')
+                plt.bar(labels, cv_vals, yerr=cv_std, color='seagreen', alpha=0.8)
+                plt.ylabel('Metric (%)' if labels and labels[0].endswith('MAPE') else 'Metric')
+                plt.title('Cross-Validation Metrics (MAPE primary)')
                 plt.tight_layout()
                 plt.savefig(output_dir / 'cv_metrics.png')
                 plt.close()
