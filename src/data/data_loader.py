@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Iterator
 from dataclasses import dataclass
 import logging
 from collections import defaultdict
+import re
 
 
 @dataclass
@@ -51,10 +52,18 @@ class DataLoader:
         self.test_annotations: List[ImageAnnotation] = []
         
     def _parse_count_from_filename(self, stem: str) -> int:
-        """Extract count from filename stem (expects leading integer before underscore)."""
+        """
+        Extract count from filename stem by reading the leading integer.
+
+        Examples:
+            "101_2025-09-30_06-37-13-880Z" -> 101
+            "10_img001" -> 10
+        """
+        match = re.match(r"(\d+)", stem)
+        if not match:
+            return None
         try:
-            first_token = stem.split('_')[0]
-            return int(first_token)
+            return int(match.group(1))
         except Exception:
             return None
 
@@ -64,6 +73,10 @@ class DataLoader:
         Args:
             input_dir: Directory containing images
         """
+        # Reset previous state
+        self.annotations = []
+        self.train_annotations = []
+        self.test_annotations = []
         self.logger.info(f"Loading images from {input_dir} using filename counts")
         input_path = Path(input_dir)
         supported_exts = {'.jpg', '.jpeg', '.png', '.tiff', '.bmp'}
@@ -340,3 +353,37 @@ class DataLoader:
             except Exception as e:
                 self.logger.error(f"Error visualizing {annotation.image_id}: {e}")
         self.logger.info(f"Generated {n_samples} normalization visualization files")
+
+    def save_count_histogram(self, output_dir: Path, filename: str = "nurdle_count_hist.png") -> None:
+        """
+        Save a histogram of nurdle counts across all loaded annotations.
+
+        Args:
+            output_dir: Directory where the plot will be written.
+            filename: Output filename for the histogram image.
+        """
+        if not self.annotations:
+            self.logger.warning("No annotations loaded; skipping count histogram")
+            return
+        counts = [ann.nurdle_count for ann in self.annotations]
+        min_c, max_c = min(counts), max(counts)
+        # Choose sensible bins for visualization; do not reuse stratification bins (they can be huge).
+        if max_c - min_c <= 200:
+            # Per-count bins for tight small ranges
+            bins = range(min_c, max_c + 2)
+        else:
+            # Automatic binning for wider ranges
+            bins = "auto"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(7, 5))
+        plt.hist(counts, bins=bins, color='steelblue', edgecolor='black', alpha=0.8)
+        plt.xlabel('Nurdle Count')
+        plt.ylabel('Number of Images')
+        plt.title('Nurdle Count Distribution')
+        plt.tight_layout()
+        plt.savefig(output_dir / filename, dpi=150)
+        plt.close()
+        self.logger.info(f"Saved nurdle count histogram to {output_dir / filename}")

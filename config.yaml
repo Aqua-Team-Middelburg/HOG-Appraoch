@@ -23,7 +23,7 @@ data:
 # Feature Extraction Configuration  
 features:
   hog_cell_size: [8, 8]           # HOG cell size (image size derived from data.target_resolution)
-  use_hog: true                  # Disable HOG (LBP-only per ablation)
+  use_hog: false                  # Disable HOG (LBP-only per ablation)
   use_lbp: true                   # Toggle LBP features (set false for ablation)
 
 # Evaluation Configuration  
@@ -33,7 +33,7 @@ evaluation:
 # Hyperparameter Optimization Configuration
 optimization:
   svr:
-    n_trials: 20
+    n_trials: 10
     c_min: 0.1
     c_max: 3.0                    # Shrink C range to reduce capacity
     eps_min: 0.05

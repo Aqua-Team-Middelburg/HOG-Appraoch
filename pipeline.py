@@ -275,6 +275,9 @@ class NurdlePipeline:
         self.data_loader.split_train_test()
         self.logger.info(f"Loaded {self.data_loader.num_annotations} images: "
                         f"{self.data_loader.num_train} train, {self.data_loader.num_test} test")
+
+        # Count distribution overview
+        self.data_loader.save_count_histogram(output_dir, filename='nurdle_count_hist.png')
         
         # THEN normalize and save (normalizes all images, saves split info)
         self.logger.info("Normalizing and saving all images...")
@@ -415,6 +418,13 @@ class NurdlePipeline:
 
         tuning_results = tuner.optimize(cv_objective, str(output_dir))
         best_params = tuning_results.get('best_params', {})
+        best_params_path = output_dir / 'best_params.json'
+        if best_params:
+            with open(best_params_path, 'w') as f:
+                json.dump(best_params, f, indent=2)
+            self.logger.info(f"Optuna best params saved to {best_params_path}. Running CV summary on tuned params (this can take several minutes)...")
+        else:
+            self.logger.warning("Optuna returned no best_params; skipping CV summary.")
 
         # Calculate best params CV mean/std for reporting
         if best_params:
@@ -470,8 +480,6 @@ class NurdlePipeline:
             }
             with open(output_dir / 'cv_summary.json', 'w') as f:
                 json.dump(cv_summary, f, indent=2)
-            with open(output_dir / 'best_params.json', 'w') as f:
-                json.dump(best_params, f, indent=2)
         return {
             'best_params': best_params,
             'best_mape': tuning_results.get('best_value'),
@@ -534,6 +542,7 @@ class NurdlePipeline:
             return val if val is not None else 'scale'
         fold_mae = []
         fold_mape = []
+        fold_rmse = []
         denom_floor = 1.0
         for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
                                                  strata if isinstance(splitter, StratifiedKFold) else None):
@@ -560,6 +569,10 @@ class NurdlePipeline:
             if not np.isfinite(mae_val):
                 mae_val = 1e6
             fold_mae.append(mae_val)
+            rmse_val = np.sqrt(mean_squared_error(y_val, preds))
+            if not np.isfinite(rmse_val):
+                rmse_val = 1e6
+            fold_rmse.append(rmse_val)
             mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, denom_floor))) * 100
             if not np.isfinite(mape_val):
                 mape_val = 1e6
@@ -567,6 +580,8 @@ class NurdlePipeline:
         cv_metrics = {
             'cv_mae_mean': float(np.mean(fold_mae)),
             'cv_mae_std': float(np.std(fold_mae)),
+            'cv_rmse_mean': float(np.mean(fold_rmse)),
+            'cv_rmse_std': float(np.std(fold_rmse)),
             'cv_mape_mean': float(np.mean(fold_mape)),
             'cv_mape_std': float(np.std(fold_mape)),
         }
@@ -578,6 +593,10 @@ class NurdlePipeline:
         self.model_trainer = ModelTrainer(config_dict)
         training_metrics = self.model_trainer.train_count_regressor(training_data)
         training_metrics.update(cv_metrics)
+        # Store explicit train-only copies to avoid confusion with CV metrics in reports
+        training_metrics.setdefault('train_mae', training_metrics.get('mae'))
+        training_metrics.setdefault('train_rmse', training_metrics.get('rmse'))
+        training_metrics.setdefault('train_mape', training_metrics.get('mape'))
 
         # Bias/variance visual: CV dispersion
         try:
@@ -604,6 +623,7 @@ class NurdlePipeline:
             def _cv_on_arrays(features_arr, targets_arr, splitter_obj):
                 fold_mae_local = []
                 fold_mape_local = []
+                fold_rmse_local = []
                 denom_floor_local = 1.0
                 for tr_idx, va_idx in splitter_obj.split(np.arange(len(targets_arr)),
                                                         self._bin_labels(targets_arr) if isinstance(splitter_obj, StratifiedKFold) else None):
@@ -630,6 +650,10 @@ class NurdlePipeline:
                     if not np.isfinite(mae_local):
                         mae_local = 1e6
                     fold_mae_local.append(mae_local)
+                    rmse_local = np.sqrt(mean_squared_error(y_val, preds_local))
+                    if not np.isfinite(rmse_local):
+                        rmse_local = 1e6
+                    fold_rmse_local.append(rmse_local)
                     mape_local = np.mean(np.abs((y_val - preds_local) / np.maximum(y_val, denom_floor_local))) * 100
                     if not np.isfinite(mape_local):
                         mape_local = 1e6
@@ -637,9 +661,12 @@ class NurdlePipeline:
                 return {
                     'cv_mae_mean': float(np.mean(fold_mae_local)),
                     'cv_mae_std': float(np.std(fold_mae_local)),
+                    'cv_rmse_mean': float(np.mean(fold_rmse_local)),
+                    'cv_rmse_std': float(np.std(fold_rmse_local)),
                     'cv_mape_mean': float(np.mean(fold_mape_local)),
                     'cv_mape_std': float(np.std(fold_mape_local)),
                     'fold_mae': [float(x) for x in fold_mae_local],
+                    'fold_rmse': [float(x) for x in fold_rmse_local],
                     'fold_mape': [float(x) for x in fold_mape_local],
                 }
 
@@ -657,8 +684,18 @@ class NurdlePipeline:
                 ablation_results[label] = _cv_on_arrays(feats, counts, splitter_ab)
 
             if ablation_results:
-                with open(output_dir / 'ablation_results.json', 'w') as f:
+                ablation_path = output_dir / 'ablation_results.json'
+                with open(ablation_path, 'w') as f:
                     json.dump(ablation_results, f, indent=2)
+                baseline_mape = training_metrics.get('cv_mape_mean')
+                if baseline_mape is not None:
+                    for label, stats in ablation_results.items():
+                        mape_val = stats.get('cv_mape_mean')
+                        if mape_val is None:
+                            continue
+                        delta = mape_val - baseline_mape
+                        self.logger.info(f"Ablation '{label}': CV MAPE {mape_val:.2f}% (delta {delta:+.2f} vs full features)")
+                self.logger.info(f"Feature ablation results saved to {ablation_path}")
         except Exception as e:
             self.logger.warning(f"Ablation run failed: {e}")
 
@@ -787,19 +824,21 @@ class NurdlePipeline:
             self.logger.warning(f"Training metrics not found at {training_metrics_path}; skipping train/test comparison plot")
         if training_metrics:
             metrics_names = ['MAE', 'RMSE', 'MAPE']
+            # Prefer CV metrics for comparison; fall back to train (resubstitution) when absent.
+            train_label = 'CV' if any(k.startswith('cv_') for k in training_metrics.keys()) else 'Train'
             train_vals = [
-                training_metrics.get('mae', 0),
-                training_metrics.get('rmse', 0),
-                training_metrics.get('mape', 0)
+                training_metrics.get('cv_mae_mean', training_metrics.get('mae', 0)),
+                training_metrics.get('cv_rmse_mean', training_metrics.get('rmse', 0)),  # rmse CV not computed; fallback
+                training_metrics.get('cv_mape_mean', training_metrics.get('mape', 0))
             ]
             test_vals = [eval_metrics['mae'], eval_metrics['rmse'], eval_metrics['mape']]
             x = np.arange(len(metrics_names))
             plt.figure(figsize=(7, 5))
-            plt.bar(x - 0.2, train_vals, width=0.4, label='Train')
+            plt.bar(x - 0.2, train_vals, width=0.4, label=train_label)
             plt.bar(x + 0.2, test_vals, width=0.4, label='Test')
             plt.xticks(x, metrics_names)
             plt.ylabel('Metric Value')
-            plt.title('Training vs Testing Metrics')
+            plt.title('Validation vs Testing Metrics' if train_label == 'CV' else 'Training vs Testing Metrics')
             plt.legend()
             plt.tight_layout()
             plt.savefig(output_dir / 'train_vs_test_metrics.png')
@@ -808,25 +847,28 @@ class NurdlePipeline:
             train_counts = [ann.nurdle_count for ann in self.data_loader.train_annotations]
             baseline_pred = float(np.mean(train_counts)) if train_counts else 0.0
             baseline_mae = mean_absolute_error(y_true, [baseline_pred] * len(y_true))
+            baseline_rmse = float(np.sqrt(np.mean((np.array(y_true) - baseline_pred) ** 2)))
             baseline_mape = np.mean(np.abs((np.array(y_true) - baseline_pred) / np.maximum(np.array(y_true), 1))) * 100
             baseline_metrics = {
                 'baseline_pred': baseline_pred,
                 'baseline_mae': float(baseline_mae),
+                'baseline_rmse': float(baseline_rmse),
                 'baseline_mape': float(baseline_mape)
             }
             with open(output_dir / 'baseline_metrics.json', 'w') as f:
                 json.dump(baseline_metrics, f, indent=2)
-            # Scatter of true vs predicted with ideal y=x reference
-            plt.figure(figsize=(6, 6))
-            plt.scatter(y_true, y_pred, alpha=0.7, color='steelblue', label='SVR predictions')
-            xy_min = min(min(y_true), min(y_pred))
-            xy_max = max(max(y_true), max(y_pred))
-            plt.plot([xy_min, xy_max], [xy_min, xy_max], 'k--', label='Ideal (y = x)')
-            plt.xlabel('True Count')
-            plt.ylabel('Predicted Count')
-            plt.title('True vs Predicted Counts')
+            # Baseline vs SVR metrics (bar chart)
+            metrics_names = ['MAE', 'RMSE', 'MAPE']
+            baseline_vals = [baseline_mae, baseline_rmse, baseline_mape]
+            svr_vals = [eval_metrics['mae'], eval_metrics['rmse'], eval_metrics['mape']]
+            x = np.arange(len(metrics_names))
+            plt.figure(figsize=(7, 5))
+            plt.bar(x - 0.2, baseline_vals, width=0.4, label='Baseline')
+            plt.bar(x + 0.2, svr_vals, width=0.4, label='SVR')
+            plt.xticks(x, metrics_names)
+            plt.ylabel('Metric Value')
+            plt.title('Baseline vs SVR (lower is better)')
             plt.legend()
-            plt.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.savefig(output_dir / 'baseline_vs_svr.png')
             plt.close()
@@ -846,15 +888,19 @@ class NurdlePipeline:
                 plt.tight_layout()
                 plt.savefig(output_dir / 'cv_metrics.png')
                 plt.close()
-        # Residuals plot
-        residuals = np.array(y_true) - np.array(y_pred)
-        plt.figure(figsize=(6, 4))
-        plt.hist(residuals, bins=15, color='slateblue', alpha=0.8)
-        plt.title('Residuals (Actual - Predicted)')
-        plt.xlabel('Residual')
-        plt.ylabel('Frequency')
+        # True vs Predicted scatter (replaces residuals histogram)
+        plt.figure(figsize=(6, 6))
+        plt.scatter(y_true, y_pred, alpha=0.7, color='steelblue', label='SVR predictions')
+        xy_min = min(min(y_true), min(y_pred))
+        xy_max = max(max(y_true), max(y_pred))
+        plt.plot([xy_min, xy_max], [xy_min, xy_max], 'k--', label='Ideal (y = x)')
+        plt.xlabel('True Count')
+        plt.ylabel('Predicted Count')
+        plt.title('True vs Predicted Counts')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(output_dir / 'residuals_hist.png')
+        plt.savefig(output_dir / 'true_vs_pred.png')
         plt.close()
         # Individual test image visualizations
         for ann, pred_count in zip(test_annots, y_pred):

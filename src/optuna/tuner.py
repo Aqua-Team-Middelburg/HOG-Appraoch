@@ -242,6 +242,9 @@ class OptunaTuner:
             # Generate visualizations (PNG, matplotlib only to avoid kaleido threads)
             if VISUALIZATION_AVAILABLE:
                 try:
+                    import matplotlib
+                    # Force a non-interactive backend so savefig cannot block on GUI.
+                    matplotlib.use("Agg", force=True)
                     from optuna.visualization.matplotlib import (
                         plot_optimization_history as mpl_plot_history,
                         plot_param_importances as mpl_plot_importances,
@@ -249,6 +252,7 @@ class OptunaTuner:
                     )
                     import matplotlib.pyplot as plt
                     import numpy as np
+                    plt.ioff()
 
                     def _save_mpl(obj, path: Path, ylog: bool = False):
                         fig = None
