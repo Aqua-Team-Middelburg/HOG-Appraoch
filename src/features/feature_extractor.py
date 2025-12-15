@@ -19,6 +19,8 @@ class FeatureExtractor:
         self.logger = logging.getLogger(__name__)
         self.hog_cell_size = tuple(config.get('hog_cell_size', [4, 4]))
         self.image_size = tuple(config.get('image_size', [1080, 1080]))
+        self.use_hog = bool(config.get('use_hog', True))
+        self.use_lbp = bool(config.get('use_lbp', True))
 
     def _apply_mask(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Apply a binary mask to an image, resizing the mask if needed."""
@@ -46,29 +48,37 @@ class FeatureExtractor:
         else:
             rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
-        # HOG per channel (captures color gradients)
-        hog_features = []
-        for c in range(3):
-            channel = rgb[:, :, c]
-            hog_feat = hog(
-                channel,
-                orientations=9,
-                pixels_per_cell=self.hog_cell_size,
-                cells_per_block=(2, 2),
-                block_norm='L2-Hys',
-                feature_vector=True
-            )
-            hog_features.append(hog_feat)
-        hog_features = np.concatenate(hog_features)
+        parts = []
 
-        # LBP on grayscale for texture
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        lbp = local_binary_pattern(gray, 8, 1, method='uniform')
-        lbp_hist, _ = np.histogram(lbp.ravel(), bins=10, range=(0, 9))
-        lbp_features = lbp_hist.astype(float)
+        if self.use_hog:
+            # HOG per channel (captures color gradients)
+            hog_features = []
+            for c in range(3):
+                channel = rgb[:, :, c]
+                hog_feat = hog(
+                    channel,
+                    orientations=9,
+                    pixels_per_cell=self.hog_cell_size,
+                    cells_per_block=(2, 2),
+                    block_norm='L2-Hys',
+                    feature_vector=True
+                )
+                hog_features.append(hog_feat)
+            hog_features = np.concatenate(hog_features)
+            parts.append(hog_features)
 
-        combined_features = np.concatenate([hog_features, lbp_features])
-        return combined_features
+        if self.use_lbp:
+            # LBP on grayscale for texture
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            lbp = local_binary_pattern(gray, 8, 1, method='uniform')
+            lbp_hist, _ = np.histogram(lbp.ravel(), bins=10, range=(0, 9))
+            lbp_features = lbp_hist.astype(float)
+            parts.append(lbp_features)
+
+        if not parts:
+            raise ValueError("FeatureExtractor: both use_hog and use_lbp are False; no features to extract.")
+
+        return np.concatenate(parts)
 
     def extract_segmented_features(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
@@ -120,37 +130,41 @@ class FeatureExtractor:
                     image = cv2.resize(image, self.image_size)
 
                 rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+                panels = [image]
+                titles = [f'Original\nCount: {annotation.nurdle_count}']
 
-                # HOG per channel (visualize: average of channel HOG images)
-                hog_images = []
-                for c in range(3):
-                    hog_feat, hog_img = hog(
-                        rgb[:, :, c],
-                        orientations=9,
-                        pixels_per_cell=self.hog_cell_size,
-                        cells_per_block=(2, 2),
-                        block_norm='L2-Hys',
-                        feature_vector=True,
-                        visualize=True
-                    )
-                    hog_images.append(exposure.rescale_intensity(hog_img, in_range='image'))
-                hog_image = np.mean(hog_images, axis=0)
+                if self.use_hog:
+                    # HOG per channel (visualize: average of channel HOG images)
+                    hog_images = []
+                    for c in range(3):
+                        _, hog_img = hog(
+                            rgb[:, :, c],
+                            orientations=9,
+                            pixels_per_cell=self.hog_cell_size,
+                            cells_per_block=(2, 2),
+                            block_norm='L2-Hys',
+                            feature_vector=True,
+                            visualize=True
+                        )
+                        hog_images.append(exposure.rescale_intensity(hog_img, in_range='image'))
+                    hog_image = np.mean(hog_images, axis=0)
+                    panels.append(hog_image)
+                    titles.append('HOG Features')
 
-                # LBP features and image
-                lbp = local_binary_pattern(gray, 8, 1, method='uniform')
+                if self.use_lbp:
+                    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+                    lbp = local_binary_pattern(gray, 8, 1, method='uniform')
+                    panels.append(lbp)
+                    titles.append('LBP Features')
 
-                fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+                fig, axes = plt.subplots(1, len(panels), figsize=(6 * len(panels), 6))
+                if len(panels) == 1:
+                    axes = [axes]
                 fig.suptitle(f'Feature Visualization: {annotation.image_id} (TEST sample)', fontsize=14, fontweight='bold')
-                axes[0].imshow(image, cmap='gray')
-                axes[0].set_title(f'Original\nCount: {annotation.nurdle_count}', fontsize=12, fontweight='bold')
-                axes[0].axis('off')
-                axes[1].imshow(hog_image, cmap='gray')
-                axes[1].set_title('HOG Features', fontsize=12, fontweight='bold')
-                axes[1].axis('off')
-                axes[2].imshow(lbp, cmap='gray')
-                axes[2].set_title('LBP Features', fontsize=12, fontweight='bold')
-                axes[2].axis('off')
+                for ax, panel, title in zip(axes, panels, titles):
+                    ax.imshow(panel, cmap='gray')
+                    ax.set_title(title, fontsize=12, fontweight='bold')
+                    ax.axis('off')
                 plt.tight_layout()
                 output_file = output_path / f'{annotation.image_id}_features.png'
                 plt.savefig(output_file, dpi=150, bbox_inches='tight')

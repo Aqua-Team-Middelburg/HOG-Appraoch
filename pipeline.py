@@ -10,6 +10,11 @@ from datetime import datetime
 import numpy as np
 import os
 import threading
+from sklearn.model_selection import StratifiedKFold, KFold
+from sklearn.svm import SVR
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # Import pipeline components
 try:
@@ -17,7 +22,6 @@ try:
     from src.data import DataLoader
     from src.features import FeatureExtractor, build_nurdle_mask
     from src.models import ModelTrainer
-    from src.evaluation import ModelEvaluator
 except ImportError as e:
     print(f"Error importing pipeline components: {e}")
     print("Make sure all src modules are properly installed")
@@ -77,6 +81,55 @@ class NurdlePipeline:
             return tuple(feature_size)
         target_res = self.config.data.get('target_resolution', 1080)
         return (target_res, target_res)
+
+    def _get_count_bins(self) -> List[float]:
+        """Count bin edges for stratification."""
+        return self.config.data.get('count_bins', [0, 10, 30, 10**9])
+
+    def _bin_labels(self, counts: np.ndarray) -> np.ndarray:
+        edges = self._get_count_bins()
+        return np.digitize(counts, edges, right=True)
+    
+    def _get_cv_splitter(self, strata: np.ndarray):
+        """Return a CV splitter; prefer stratified if class sizes allow."""
+        if len(strata) < 2:
+            raise ValueError(f"Need at least 2 samples for CV splitting; got {len(strata)}")
+        desired_folds = self.config.data.get('cv_folds', 5)
+        bincount = np.bincount(strata) if len(strata) else np.array([0])
+        min_class = np.min(bincount[bincount > 0]) if np.any(bincount > 0) else 0
+        if min_class >= max(2, desired_folds):
+            return StratifiedKFold(n_splits=desired_folds, shuffle=True, random_state=42)
+        # Fallback: non-stratified KFold with safe n_splits
+        n_splits = min(max(2, desired_folds), len(strata))
+        return KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    def _svr_bounds(self) -> Dict[str, Any]:
+        """Read SVR bounds from config (optimization.svr) with safe defaults."""
+        opt_cfg = getattr(self.config, 'optimization', {}) or {}
+        bounds = opt_cfg.get('svr', {})
+        return {
+            'c_min': bounds.get('c_min', 0.1),
+            'c_max': bounds.get('c_max', 10.0),
+            'eps_min': bounds.get('eps_min', 0.01),
+            'eps_max': bounds.get('eps_max', 0.5),
+            'kernel': bounds.get('kernel', 'rbf'),
+            'gamma': bounds.get('gamma', 'scale'),
+            'gamma_min': bounds.get('gamma_min'),
+            'gamma_max': bounds.get('gamma_max'),
+            'n_trials': bounds.get('n_trials', opt_cfg.get('n_trials', 5))
+        }
+
+    def _build_features_from_indices(self, annotations: List[Any], indices: np.ndarray, feature_extractor) -> Tuple[np.ndarray, np.ndarray]:
+        """Build feature matrix and target vector for a subset of annotations."""
+        feats = []
+        targets = []
+        for idx in indices:
+            ann = annotations[idx]
+            image = self.data_loader.load_image(ann.image_path)
+            fvec = feature_extractor.extract_image_features(image)
+            feats.append(fvec)
+            targets.append(ann.nurdle_count)
+        return np.array(feats), np.array(targets)
     
     def _setup_logging(self):
         """Setup pipeline-specific logging."""
@@ -108,6 +161,7 @@ class NurdlePipeline:
             
             logger.addHandler(console_handler)
             logger.addHandler(file_handler)
+            logger.propagate = False
         
         return logger
     
@@ -221,6 +275,9 @@ class NurdlePipeline:
         self.data_loader.split_train_test()
         self.logger.info(f"Loaded {self.data_loader.num_annotations} images: "
                         f"{self.data_loader.num_train} train, {self.data_loader.num_test} test")
+
+        # Count distribution overview
+        self.data_loader.save_count_histogram(output_dir, filename='nurdle_count_hist.png')
         
         # THEN normalize and save (normalizes all images, saves split info)
         self.logger.info("Normalizing and saving all images...")
@@ -258,7 +315,9 @@ class NurdlePipeline:
         image_size = self._get_feature_image_size()
         feature_config = {
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': image_size
+            'image_size': image_size,
+            'use_hog': self.config.features.get('use_hog', True),
+            'use_lbp': self.config.features.get('use_lbp', True),
         }
         self.feature_extractor = FeatureExtractor(feature_config)
         # Visualize feature samples for up to 3 test images
@@ -290,25 +349,141 @@ class NurdlePipeline:
         image_size = self._get_feature_image_size()
         feature_config = {
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': image_size
+            'image_size': image_size,
+            'use_hog': self.config.features.get('use_hog', True),
+            'use_lbp': self.config.features.get('use_lbp', True),
         }
         self.feature_extractor = FeatureExtractor(feature_config)
-        training_data: List[Tuple[np.ndarray, int]] = []
-        for batch in self.data_loader.get_image_batches(self.data_loader.train_annotations):
-            self.logger.debug(f"Tuning: processing batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
-            batch_pairs = list(self.feature_extractor.generate_training_data(
-                batch, self.data_loader.load_image))
-            training_data.extend(batch_pairs)
-        config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
+        train_annotations = self.data_loader.train_annotations
+        y_all = np.array([ann.nurdle_count for ann in train_annotations])
+        strata = self._bin_labels(y_all)
+
+        config_dict = getattr(self.config, '_config', self.config if isinstance(self.config, dict) else {})
         tuner = OptunaTuner(config_dict)
-        def trainer_func(params):
-            trainer = ModelTrainer({**config_dict, **params})
-            return trainer.train_count_regressor(training_data)
-        tuning_results = tuner.optimize(trainer_func, str(output_dir))
+
+        def cv_objective(params: Dict[str, Any]) -> Dict[str, Any]:
+            splitter = self._get_cv_splitter(strata)
+            fold_mae = []
+            fold_mape = []
+            bnds = self._svr_bounds()
+            denom_floor = 1.0
+            for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
+                                                    strata if isinstance(splitter, StratifiedKFold) else None):
+                X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
+                X_val, y_val = self._build_features_from_indices(train_annotations, val_idx, self.feature_extractor)
+                y_tr_log = np.log1p(y_tr)
+                C_val = max(bnds['c_min'], min(params.get('svr_c', 1.0), bnds['c_max']))
+                eps_val = max(bnds['eps_min'], min(params.get('svr_epsilon', 0.1), bnds['eps_max']))
+                kernel_val = params.get('svr_kernel', bnds['kernel'])
+                gamma_val = params.get('svr_gamma', bnds.get('gamma', 'scale'))
+                if isinstance(gamma_val, (int, float, np.floating)):
+                    if bnds.get('gamma_min') is not None:
+                        gamma_val = max(bnds['gamma_min'], gamma_val)
+                    if bnds.get('gamma_max') is not None:
+                        gamma_val = min(bnds['gamma_max'], gamma_val)
+                kernel_val = bnds['kernel']  # enforce configured kernel
+                reg = make_pipeline(
+                    StandardScaler(),
+                    SVR(
+                        C=C_val,
+                        kernel=kernel_val,
+                        gamma=gamma_val,
+                        epsilon=eps_val
+                    )
+                )
+                reg.fit(X_tr, y_tr_log)
+                preds_log = reg.predict(X_val)
+                # cap to avoid overflow in expm1
+                max_log = np.log1p(np.max(y_tr)) + 2.0
+                preds_log = np.clip(preds_log, a_min=-5.0, a_max=max_log)
+                preds = np.expm1(preds_log)
+                preds = np.clip(preds, 0, np.max(y_tr) + 50)
+                preds = np.nan_to_num(preds, nan=1e6, posinf=1e6, neginf=0)
+                mae_val = mean_absolute_error(y_val, preds)
+                mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, denom_floor))) * 100
+                if not np.isfinite(mae_val):
+                    mae_val = 1e6
+                if not np.isfinite(mape_val):
+                    mape_val = 1e6
+                fold_mae.append(mae_val)
+                fold_mape.append(mape_val)
+            # Return full metrics dict for the tuner (Optuna expects .get access)
+            return {
+                'mape': float(np.mean(fold_mape)),
+                'fold_mape': [float(m) for m in fold_mape],
+                'mae': float(np.mean(fold_mae)),
+                'fold_mae': [float(m) for m in fold_mae],
+                'n_folds': len(fold_mae)
+            }
+
+        tuning_results = tuner.optimize(cv_objective, str(output_dir))
         best_params = tuning_results.get('best_params', {})
+        best_params_path = output_dir / 'best_params.json'
+        if best_params:
+            with open(best_params_path, 'w') as f:
+                json.dump(best_params, f, indent=2)
+            self.logger.info(f"Optuna best params saved to {best_params_path}. Running CV summary on tuned params (this can take several minutes)...")
+        else:
+            self.logger.warning("Optuna returned no best_params; skipping CV summary.")
+
+        # Calculate best params CV mean/std for reporting
+        if best_params:
+            splitter_final = self._get_cv_splitter(strata)
+            fold_mae = []
+            fold_mape = []
+            bnds = self._svr_bounds()
+            denom_floor = 1.0
+            for train_idx, val_idx in splitter_final.split(np.arange(len(train_annotations)),
+                                                           strata if isinstance(splitter_final, StratifiedKFold) else None):
+                X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
+                X_val, y_val = self._build_features_from_indices(train_annotations, val_idx, self.feature_extractor)
+                y_tr_log = np.log1p(y_tr)
+                C_val = max(bnds['c_min'], min(best_params.get('svr_c', 1.0), bnds['c_max']))
+                eps_val = max(bnds['eps_min'], min(best_params.get('svr_epsilon', 0.1), bnds['eps_max']))
+                kernel_val = bnds['kernel']
+                gamma_val = best_params.get('svr_gamma', bnds.get('gamma', 'scale'))
+                if isinstance(gamma_val, (int, float, np.floating)):
+                    if bnds.get('gamma_min') is not None:
+                        gamma_val = max(bnds['gamma_min'], gamma_val)
+                    if bnds.get('gamma_max') is not None:
+                        gamma_val = min(bnds['gamma_max'], gamma_val)
+                reg = make_pipeline(
+                    StandardScaler(),
+                    SVR(
+                        C=C_val,
+                        kernel=kernel_val,
+                        gamma=gamma_val,
+                        epsilon=eps_val
+                    )
+                )
+                reg.fit(X_tr, y_tr_log)
+                max_log = np.log1p(np.max(y_tr)) + 2.0
+                preds_log = reg.predict(X_val)
+                preds_log = np.clip(preds_log, a_min=-5.0, a_max=max_log)
+                preds = np.expm1(preds_log)
+                preds = np.clip(preds, 0, np.max(y_tr) + 50)
+                preds = np.nan_to_num(preds, nan=1e6, posinf=1e6, neginf=0)
+                mae_val = mean_absolute_error(y_val, preds)
+                if not np.isfinite(mae_val):
+                    mae_val = 1e6
+                fold_mae.append(mae_val)
+                mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, denom_floor))) * 100
+                if not np.isfinite(mape_val):
+                    mape_val = 1e6
+                fold_mape.append(mape_val)
+            cv_summary = {
+                'primary_metric': 'mape',
+                'cv_mae_mean': float(np.mean(fold_mae)),
+                'cv_mae_std': float(np.std(fold_mae)),
+                'cv_mape_mean': float(np.mean(fold_mape)),
+                'cv_mape_std': float(np.std(fold_mape)),
+            }
+            with open(output_dir / 'cv_summary.json', 'w') as f:
+                json.dump(cv_summary, f, indent=2)
         return {
             'best_params': best_params,
-            'best_mae': tuning_results.get('best_value'),
+            'best_mape': tuning_results.get('best_value'),
+            'best_value': tuning_results.get('best_value'),
             'n_trials': tuning_results.get('n_trials'),
             'output_dir': str(output_dir),
             'tuning_results_path': str(output_dir / 'tuning_results.json'),
@@ -334,18 +509,246 @@ class NurdlePipeline:
         image_size = self._get_feature_image_size()
         feature_config = {
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': image_size
+            'image_size': image_size,
+            'use_hog': self.config.features.get('use_hog', True),
+            'use_lbp': self.config.features.get('use_lbp', True),
         }
         self.feature_extractor = FeatureExtractor(feature_config)
-        training_data: List[Tuple[np.ndarray, int]] = []
-        for batch in self.data_loader.get_image_batches(self.data_loader.train_annotations):
-            self.logger.debug(f"Training: processing batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
-            batch_pairs = list(self.feature_extractor.generate_training_data(
-                batch, self.data_loader.load_image))
-            training_data.extend(batch_pairs)
+        # Load best params from tuning if available
+        tuning_best_path = self.output_dirs['tuning'] / 'best_params.json'
         config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
+        if tuning_best_path.exists():
+            with open(tuning_best_path, 'r') as f:
+                best_params = json.load(f)
+            config_dict = {**config_dict, **best_params}
+            self.logger.info(f"Using tuned params: {best_params}")
+
+        # Compute CV metrics with selected params
+        train_annotations = self.data_loader.train_annotations
+        y_all = np.array([ann.nurdle_count for ann in train_annotations])
+        strata = self._bin_labels(y_all)
+        splitter = self._get_cv_splitter(strata)
+        bnds = self._svr_bounds()
+
+        def _resolve_gamma(val):
+            """Normalize gamma value from config/best_params to a valid SVR input."""
+            if isinstance(val, (list, tuple)):
+                return val[0] if len(val) > 0 else 'scale'
+            if isinstance(val, (int, float, np.floating)):
+                if bnds.get('gamma_min') is not None:
+                    val = max(bnds['gamma_min'], val)
+                if bnds.get('gamma_max') is not None:
+                    val = min(bnds['gamma_max'], val)
+            return val if val is not None else 'scale'
+        fold_mae = []
+        fold_mape = []
+        fold_rmse = []
+        denom_floor = 1.0
+        for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
+                                                 strata if isinstance(splitter, StratifiedKFold) else None):
+            X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
+            X_val, y_val = self._build_features_from_indices(train_annotations, val_idx, self.feature_extractor)
+            y_tr_log = np.log1p(y_tr)
+            reg = make_pipeline(
+                StandardScaler(),
+                SVR(
+                    C=max(bnds['c_min'], min(config_dict.get('svr_c', 1.0), bnds['c_max'])),
+                    kernel=bnds['kernel'],
+                    gamma=_resolve_gamma(config_dict.get('svr_gamma', bnds.get('gamma', 'scale'))),
+                    epsilon=max(bnds['eps_min'], min(config_dict.get('svr_epsilon', 0.1), bnds['eps_max']))
+                )
+            )
+            reg.fit(X_tr, y_tr_log)
+            preds_log = reg.predict(X_val)
+            max_log = np.log1p(np.max(y_tr)) + 2.0
+            preds_log = np.clip(preds_log, a_min=-5.0, a_max=max_log)
+            preds = np.expm1(preds_log)
+            preds = np.clip(preds, 0, np.max(y_tr) + 50)
+            preds = np.nan_to_num(preds, nan=1e6, posinf=1e6, neginf=0)
+            mae_val = mean_absolute_error(y_val, preds)
+            if not np.isfinite(mae_val):
+                mae_val = 1e6
+            fold_mae.append(mae_val)
+            rmse_val = np.sqrt(mean_squared_error(y_val, preds))
+            if not np.isfinite(rmse_val):
+                rmse_val = 1e6
+            fold_rmse.append(rmse_val)
+            mape_val = np.mean(np.abs((y_val - preds) / np.maximum(y_val, denom_floor))) * 100
+            if not np.isfinite(mape_val):
+                mape_val = 1e6
+            fold_mape.append(mape_val)
+        cv_metrics = {
+            'cv_mae_mean': float(np.mean(fold_mae)),
+            'cv_mae_std': float(np.std(fold_mae)),
+            'cv_rmse_mean': float(np.mean(fold_rmse)),
+            'cv_rmse_std': float(np.std(fold_rmse)),
+            'cv_mape_mean': float(np.mean(fold_mape)),
+            'cv_mape_std': float(np.std(fold_mape)),
+        }
+
+        # Fit final model on full training set (build once)
+        full_features, full_counts = self._build_features_from_indices(train_annotations, np.arange(len(train_annotations)), self.feature_extractor)
+        training_data = list(zip(full_features, full_counts))
+        config_dict['svr_bounds'] = self._svr_bounds()
         self.model_trainer = ModelTrainer(config_dict)
         training_metrics = self.model_trainer.train_count_regressor(training_data)
+        training_metrics.update(cv_metrics)
+        # Store explicit train-only copies to avoid confusion with CV metrics in reports
+        training_metrics.setdefault('train_mae', training_metrics.get('mae'))
+        training_metrics.setdefault('train_rmse', training_metrics.get('rmse'))
+        training_metrics.setdefault('train_mape', training_metrics.get('mape'))
+
+        # Bias/variance visual: CV dispersion
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(5, 4))
+            plt.boxplot(fold_mape, vert=True, patch_artist=True, labels=['CV MAPE'])
+            plt.ylabel('MAPE (%)')
+            plt.title('CV MAPE Dispersion')
+            plt.tight_layout()
+            plt.savefig(output_dir / 'cv_dispersion.png', dpi=150, bbox_inches='tight')
+            plt.close()
+        except Exception as e:
+            self.logger.warning(f"Could not generate CV dispersion plot: {e}")
+
+        # Ablation: toggle feature flags (HOG/LBP) for comparison
+        ablation_results = {}
+        try:
+            ablation_cfgs = []
+            if self.config.features.get('use_lbp', True):
+                ablation_cfgs.append(('no_lbp', {**feature_config, 'use_lbp': False}))
+            if self.config.features.get('use_hog', True):
+                ablation_cfgs.append(('no_hog', {**feature_config, 'use_hog': False}))
+
+            def _cv_on_arrays(features_arr, targets_arr, splitter_obj):
+                fold_mae_local = []
+                fold_mape_local = []
+                fold_rmse_local = []
+                denom_floor_local = 1.0
+                for tr_idx, va_idx in splitter_obj.split(np.arange(len(targets_arr)),
+                                                        self._bin_labels(targets_arr) if isinstance(splitter_obj, StratifiedKFold) else None):
+                    X_tr, y_tr = features_arr[tr_idx], targets_arr[tr_idx]
+                    X_val, y_val = features_arr[va_idx], targets_arr[va_idx]
+                    y_tr_log_local = np.log1p(y_tr)
+                    reg_local = make_pipeline(
+                        StandardScaler(),
+                        SVR(
+                            C=max(bnds['c_min'], min(config_dict.get('svr_c', 1.0), bnds['c_max'])),
+                            kernel=bnds['kernel'],
+                            gamma=_resolve_gamma(config_dict.get('svr_gamma', bnds.get('gamma', 'scale'))),
+                            epsilon=max(bnds['eps_min'], min(config_dict.get('svr_epsilon', 0.1), bnds['eps_max']))
+                        )
+                    )
+                    reg_local.fit(X_tr, y_tr_log_local)
+                    preds_log_local = reg_local.predict(X_val)
+                    max_log_local = np.log1p(np.max(y_tr)) + 2.0
+                    preds_log_local = np.clip(preds_log_local, a_min=-5.0, a_max=max_log_local)
+                    preds_local = np.expm1(preds_log_local)
+                    preds_local = np.clip(preds_local, 0, np.max(y_tr) + 50)
+                    preds_local = np.nan_to_num(preds_local, nan=1e6, posinf=1e6, neginf=0)
+                    mae_local = mean_absolute_error(y_val, preds_local)
+                    if not np.isfinite(mae_local):
+                        mae_local = 1e6
+                    fold_mae_local.append(mae_local)
+                    rmse_local = np.sqrt(mean_squared_error(y_val, preds_local))
+                    if not np.isfinite(rmse_local):
+                        rmse_local = 1e6
+                    fold_rmse_local.append(rmse_local)
+                    mape_local = np.mean(np.abs((y_val - preds_local) / np.maximum(y_val, denom_floor_local))) * 100
+                    if not np.isfinite(mape_local):
+                        mape_local = 1e6
+                    fold_mape_local.append(mape_local)
+                return {
+                    'cv_mae_mean': float(np.mean(fold_mae_local)),
+                    'cv_mae_std': float(np.std(fold_mae_local)),
+                    'cv_rmse_mean': float(np.mean(fold_rmse_local)),
+                    'cv_rmse_std': float(np.std(fold_rmse_local)),
+                    'cv_mape_mean': float(np.mean(fold_mape_local)),
+                    'cv_mape_std': float(np.std(fold_mape_local)),
+                    'fold_mae': [float(x) for x in fold_mae_local],
+                    'fold_rmse': [float(x) for x in fold_rmse_local],
+                    'fold_mape': [float(x) for x in fold_mape_local],
+                }
+
+            for label, cfg in ablation_cfgs:
+                ab_extractor = FeatureExtractor(cfg)
+                feats = []
+                counts = []
+                for ann in train_annotations:
+                    img = self.data_loader.load_image(ann.image_path)
+                    feats.append(ab_extractor.extract_image_features(img))
+                    counts.append(ann.nurdle_count)
+                feats = np.array(feats)
+                counts = np.array(counts)
+                splitter_ab = self._get_cv_splitter(self._bin_labels(counts))
+                ablation_results[label] = _cv_on_arrays(feats, counts, splitter_ab)
+
+            if ablation_results:
+                ablation_path = output_dir / 'ablation_results.json'
+                with open(ablation_path, 'w') as f:
+                    json.dump(ablation_results, f, indent=2)
+                baseline_mape = training_metrics.get('cv_mape_mean')
+                if baseline_mape is not None:
+                    for label, stats in ablation_results.items():
+                        mape_val = stats.get('cv_mape_mean')
+                        if mape_val is None:
+                            continue
+                        delta = mape_val - baseline_mape
+                        self.logger.info(f"Ablation '{label}': CV MAPE {mape_val:.2f}% (delta {delta:+.2f} vs full features)")
+                self.logger.info(f"Feature ablation results saved to {ablation_path}")
+        except Exception as e:
+            self.logger.warning(f"Ablation run failed: {e}")
+
+        # Learning curve on fractions of training data (using best params)
+        learning_curve = []
+        try:
+            rng = np.random.default_rng(42)
+            fractions = [0.2, 0.4, 0.6, 0.8, 1.0]
+            base_indices = np.arange(len(full_counts))
+            rng.shuffle(base_indices)
+
+            def _cv_mape_on_subset(idx_subset):
+                subset_feats = full_features[idx_subset]
+                subset_counts = full_counts[idx_subset]
+                splitter_subset = self._get_cv_splitter(self._bin_labels(subset_counts))
+                stats = _cv_on_arrays(subset_feats, subset_counts, splitter_subset)
+                return stats
+
+            for frac in fractions:
+                n = max(2, int(len(base_indices) * frac))
+                idx_subset = base_indices[:n]
+                stats = _cv_mape_on_subset(idx_subset)
+                learning_curve.append({
+                    'fraction': frac,
+                    'n_samples': int(n),
+                    **stats
+                })
+
+            if learning_curve:
+                try:
+                    import matplotlib.pyplot as plt
+                    plt.figure(figsize=(6, 4))
+                    plt.errorbar(
+                        [p['fraction'] for p in learning_curve],
+                        [p['cv_mape_mean'] for p in learning_curve],
+                        yerr=[p.get('cv_mape_std', 0) for p in learning_curve],
+                        fmt='-o',
+                        capsize=4
+                    )
+                    plt.xlabel('Training Fraction')
+                    plt.ylabel('CV MAPE (%)')
+                    plt.title('Learning Curve (MAPE)')
+                    plt.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    plt.savefig(output_dir / 'learning_curve.png', dpi=150, bbox_inches='tight')
+                    plt.close()
+                except Exception as e:
+                    self.logger.warning(f"Could not plot learning curve: {e}")
+                with open(output_dir / 'learning_curve.json', 'w') as f:
+                    json.dump(learning_curve, f, indent=2)
+        except Exception as e:
+            self.logger.warning(f"Learning curve computation failed: {e}")
+
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self.model_trainer.save_model(str(self.models_dir))
         metrics_path = output_dir / 'training_metrics.json'
@@ -380,12 +783,13 @@ class NurdlePipeline:
         image_size = self._get_feature_image_size()
         feature_config = {
             'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': image_size
+            'image_size': image_size,
+            'use_hog': self.config.features.get('use_hog', True),
+            'use_lbp': self.config.features.get('use_lbp', True),
         }
         feature_extractor = FeatureExtractor(feature_config)
         model_trainer = ModelTrainer(self.config if isinstance(self.config, dict) else vars(self.config))
         model_trainer.load_model(str(self.models_dir))
-        self.evaluator = ModelEvaluator()
         test_annots = self.data_loader.test_annotations
         y_true = []
         y_pred = []
@@ -428,23 +832,84 @@ class NurdlePipeline:
             self.logger.warning(f"Training metrics not found at {training_metrics_path}; skipping train/test comparison plot")
         if training_metrics:
             metrics_names = ['MAE', 'RMSE', 'MAPE']
+            # Prefer CV metrics for comparison; fall back to train (resubstitution) when absent.
+            train_label = 'CV' if any(k.startswith('cv_') for k in training_metrics.keys()) else 'Train'
             train_vals = [
-                training_metrics.get('mae', 0),
-                training_metrics.get('rmse', 0),
-                training_metrics.get('mape', 0)
+                training_metrics.get('cv_mae_mean', training_metrics.get('mae', 0)),
+                training_metrics.get('cv_rmse_mean', training_metrics.get('rmse', 0)),  # rmse CV not computed; fallback
+                training_metrics.get('cv_mape_mean', training_metrics.get('mape', 0))
             ]
             test_vals = [eval_metrics['mae'], eval_metrics['rmse'], eval_metrics['mape']]
             x = np.arange(len(metrics_names))
             plt.figure(figsize=(7, 5))
-            plt.bar(x - 0.2, train_vals, width=0.4, label='Train')
+            plt.bar(x - 0.2, train_vals, width=0.4, label=train_label)
             plt.bar(x + 0.2, test_vals, width=0.4, label='Test')
             plt.xticks(x, metrics_names)
             plt.ylabel('Metric Value')
-            plt.title('Training vs Testing Metrics')
+            plt.title('Validation vs Testing Metrics' if train_label == 'CV' else 'Training vs Testing Metrics')
             plt.legend()
             plt.tight_layout()
             plt.savefig(output_dir / 'train_vs_test_metrics.png')
             plt.close()
+            # Baseline vs model
+            train_counts = [ann.nurdle_count for ann in self.data_loader.train_annotations]
+            baseline_pred = float(np.mean(train_counts)) if train_counts else 0.0
+            baseline_mae = mean_absolute_error(y_true, [baseline_pred] * len(y_true))
+            baseline_rmse = float(np.sqrt(np.mean((np.array(y_true) - baseline_pred) ** 2)))
+            baseline_mape = np.mean(np.abs((np.array(y_true) - baseline_pred) / np.maximum(np.array(y_true), 1))) * 100
+            baseline_metrics = {
+                'baseline_pred': baseline_pred,
+                'baseline_mae': float(baseline_mae),
+                'baseline_rmse': float(baseline_rmse),
+                'baseline_mape': float(baseline_mape)
+            }
+            with open(output_dir / 'baseline_metrics.json', 'w') as f:
+                json.dump(baseline_metrics, f, indent=2)
+            # Baseline vs SVR metrics (bar chart)
+            metrics_names = ['MAE', 'RMSE', 'MAPE']
+            baseline_vals = [baseline_mae, baseline_rmse, baseline_mape]
+            svr_vals = [eval_metrics['mae'], eval_metrics['rmse'], eval_metrics['mape']]
+            x = np.arange(len(metrics_names))
+            plt.figure(figsize=(7, 5))
+            plt.bar(x - 0.2, baseline_vals, width=0.4, label='Baseline')
+            plt.bar(x + 0.2, svr_vals, width=0.4, label='SVR')
+            plt.xticks(x, metrics_names)
+            plt.ylabel('Metric Value')
+            plt.title('Baseline vs SVR (lower is better)')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(output_dir / 'baseline_vs_svr.png')
+            plt.close()
+            # CV summary if available
+            if all(k in training_metrics for k in ['cv_mape_mean', 'cv_mape_std']):
+                labels = ['CV MAPE']
+                cv_vals = [training_metrics['cv_mape_mean']]
+                cv_std = [training_metrics.get('cv_mape_std', 0)]
+                if all(k in training_metrics for k in ['cv_mae_mean', 'cv_mae_std']):
+                    labels.append('CV MAE')
+                    cv_vals.append(training_metrics['cv_mae_mean'])
+                    cv_std.append(training_metrics.get('cv_mae_std', 0))
+                plt.figure(figsize=(6, 4))
+                plt.bar(labels, cv_vals, yerr=cv_std, color='seagreen', alpha=0.8)
+                plt.ylabel('Metric (%)' if labels and labels[0].endswith('MAPE') else 'Metric')
+                plt.title('Cross-Validation Metrics (MAPE primary)')
+                plt.tight_layout()
+                plt.savefig(output_dir / 'cv_metrics.png')
+                plt.close()
+        # True vs Predicted scatter (replaces residuals histogram)
+        plt.figure(figsize=(6, 6))
+        plt.scatter(y_true, y_pred, alpha=0.7, color='steelblue', label='SVR predictions')
+        xy_min = min(min(y_true), min(y_pred))
+        xy_max = max(max(y_true), max(y_pred))
+        plt.plot([xy_min, xy_max], [xy_min, xy_max], 'k--', label='Ideal (y = x)')
+        plt.xlabel('True Count')
+        plt.ylabel('Predicted Count')
+        plt.title('True vs Predicted Counts')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(output_dir / 'true_vs_pred.png')
+        plt.close()
         # Individual test image visualizations
         for ann, pred_count in zip(test_annots, y_pred):
             img = self.data_loader.load_image(ann.image_path)

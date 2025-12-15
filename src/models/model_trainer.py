@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any
 import logging
 from sklearn.svm import SVR
-
-
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
 class ModelTrainer:
     """
@@ -32,12 +32,40 @@ class ModelTrainer:
         X = np.array([f for f, c in training_data])
         y_true = np.array([c for f, c in training_data])
         y_log = np.log1p(y_true)
+        bounds = self.config.get('svr_bounds', {})
+        c_min = bounds.get('c_min', 0.1)
+        c_max = bounds.get('c_max', 10.0)
+        eps_min = bounds.get('eps_min', 0.01)
+        eps_max = bounds.get('eps_max', 0.5)
+        kernel_val = bounds.get('kernel', 'rbf')
+        gamma_val = self.config.get('svr_gamma', bounds.get('gamma', 'scale'))
+
+        def _resolve_gamma(val):
+            """
+            Normalize gamma to a value accepted by sklearn:
+            - If a list/tuple is provided (from config), take the first choice.
+            - If numeric, clamp to optional bounds.
+            - Default to 'scale' when missing.
+            """
+            if isinstance(val, (list, tuple)):
+                val = val[0] if len(val) > 0 else 'scale'
+            if isinstance(val, (int, float, np.floating)):
+                if bounds.get('gamma_min') is not None:
+                    val = max(bounds['gamma_min'], val)
+                if bounds.get('gamma_max') is not None:
+                    val = min(bounds['gamma_max'], val)
+            if val is None:
+                val = 'scale'
+            return val
         # Suppress all info-level logging during training/tuning
-        self.svr_regressor = SVR(
-            C=self.config.get('svr_c', 1.0),
-            kernel=self.config.get('svr_kernel', 'rbf'),
-            gamma=self.config.get('svr_gamma', 'scale'),
-            epsilon=self.config.get('svr_epsilon', 0.1)
+        self.svr_regressor = make_pipeline(
+            StandardScaler(),
+            SVR(
+                C=max(c_min, min(self.config.get('svr_c', 1.0), c_max)),
+                kernel=kernel_val,
+                gamma=_resolve_gamma(gamma_val),
+                epsilon=max(eps_min, min(self.config.get('svr_epsilon', 0.1), eps_max))
+            )
         )
         self.svr_regressor.fit(X, y_log)
         y_log_pred = self.svr_regressor.predict(X)
@@ -66,8 +94,10 @@ class ModelTrainer:
             raise ValueError("SVR regressor not trained")
         features_2d = features.reshape(1, -1)
         log_pred = float(self.svr_regressor.predict(features_2d)[0])
+        log_pred = np.clip(log_pred, a_min=-5.0, a_max=np.log1p(np.max([0, 1000])) + 2.0)
         count_pred = np.expm1(log_pred)
-        return max(0.0, count_pred)
+        count_pred = np.clip(count_pred, 0, None)
+        return float(count_pred)
 
     def save_model(self, output_dir: str) -> None:
         output_path = Path(output_dir)

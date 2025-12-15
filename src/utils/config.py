@@ -25,13 +25,13 @@ class Config:
         
         return self._config
     
-    def get(self, section: str) -> Dict[str, Any]:
+    def get(self, section: str, default: Any = None) -> Dict[str, Any]:
         """Get configuration section (e.g., 'data', 'training', 'windows')."""
         if self._config is None:
             self.load()
         if self._config is None:
-            return {}
-        return self._config.get(section, {})
+            return default
+        return self._config.get(section, default)
     
     @property 
     def data(self) -> Dict[str, Any]:
@@ -57,6 +57,11 @@ class Config:
     def evaluation(self) -> Dict[str, Any]:
         """Get evaluation configuration."""
         return self.get('evaluation')
+
+    @property
+    def optimization(self) -> Dict[str, Any]:
+        """Get optimization configuration."""
+        return self.get('optimization', {})
 
 
 def load_config(config_path: str = "config.yaml") -> Config:
