@@ -121,13 +121,25 @@ class NurdlePipeline:
         }
 
     def _build_features_from_indices(self, annotations: List[Any], indices: np.ndarray, feature_extractor) -> Tuple[np.ndarray, np.ndarray]:
-        """Build feature matrix and target vector for a subset of annotations."""
+        """Build feature matrix and target vector for a subset of annotations.
+        
+        Applies segmentation to isolate nurdle regions before feature extraction.
+        """
         feats = []
         targets = []
+        seg_config = self.config.features.get('segmentation', {})
         for idx in indices:
             ann = annotations[idx]
             image = self.data_loader.load_image(ann.image_path)
-            fvec = feature_extractor.extract_image_features(image)
+            # Apply segmentation to isolate nurdle regions
+            mask = build_nurdle_mask(
+                image,
+                min_dist=seg_config.get('min_dist', 8),
+                min_area=seg_config.get('min_area', 50),
+                max_area=seg_config.get('max_area', 2000)
+            )
+            # Extract features from segmented regions only
+            fvec = feature_extractor.extract_image_features(image, mask=mask)
             feats.append(fvec)
             targets.append(ann.nurdle_count)
         return np.array(feats), np.array(targets)
