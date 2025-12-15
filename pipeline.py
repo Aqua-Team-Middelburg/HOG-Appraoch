@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple
 from datetime import datetime
 import numpy as np
+import cv2
 import os
 import threading
 from sklearn.model_selection import StratifiedKFold, KFold
@@ -913,9 +914,11 @@ class NurdlePipeline:
         # Individual test image visualizations
         for ann, pred_count in zip(test_annots, y_pred):
             img = self.data_loader.load_image(ann.image_path)
+            # Convert BGR to RGB for correct color display
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             actual_count = ann.nurdle_count
             plt.figure(figsize=(6, 6))
-            plt.imshow(img, cmap='gray')
+            plt.imshow(img_rgb)
             plt.title(f"Actual: {actual_count} | Predicted: {pred_count:.1f}")
             plt.axis('off')
             out_path = output_dir / f"{ann.image_id}_eval.png"
