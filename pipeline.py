@@ -123,7 +123,8 @@ class NurdlePipeline:
     def _build_features_from_indices(self, annotations: List[Any], indices: np.ndarray, feature_extractor) -> Tuple[np.ndarray, np.ndarray]:
         """Build feature matrix and target vector for a subset of annotations.
         
-        Applies segmentation to isolate nurdle regions before feature extraction.
+        Extracts HOG+LBP features from raw images and concatenates with segmentation mask statistics.
+        This approach passes segmentation information in parallel with features to the model.
         """
         feats = []
         targets = []
@@ -131,15 +132,15 @@ class NurdlePipeline:
         for idx in indices:
             ann = annotations[idx]
             image = self.data_loader.load_image(ann.image_path)
-            # Apply segmentation to isolate nurdle regions
+            # Generate segmentation mask (used for statistics, not to mask features)
             mask = build_nurdle_mask(
                 image,
                 min_dist=seg_config.get('min_dist', 8),
                 min_area=seg_config.get('min_area', 50),
                 max_area=seg_config.get('max_area', 2000)
             )
-            # Extract features from segmented regions only
-            fvec = feature_extractor.extract_image_features(image, mask=mask)
+            # Extract HOG+LBP from raw image with mask statistics concatenated
+            fvec = feature_extractor.extract_features_with_mask_stats(image, mask)
             feats.append(fvec)
             targets.append(ann.nurdle_count)
         return np.array(feats), np.array(targets)
@@ -811,14 +812,15 @@ class NurdlePipeline:
             self.logger.debug(f"Evaluating batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
             for annot in batch:
                 image = self.data_loader.load_image(annot.image_path)
-                # Test-time preprocessing: restrict HOG/LBP to segmented nurdle regions
+                # Generate segmentation mask for statistics
                 mask = build_nurdle_mask(
                     image,
                     min_dist=seg_config.get('min_dist', 8),
                     min_area=seg_config.get('min_area', 50),
                     max_area=seg_config.get('max_area', 2000)
                 )
-                features = feature_extractor.extract_image_features(image, mask=mask)
+                # Extract features from raw image with mask statistics concatenated
+                features = feature_extractor.extract_features_with_mask_stats(image, mask)
                 pred_count = model_trainer.predict_count(features)
                 y_true.append(annot.nurdle_count)
                 y_pred.append(pred_count)
