@@ -1,18 +1,8 @@
 """
-Main Evaluation Module for Nurdle Detection Pipeline
-===================================================
+Model Evaluation for Nurdle Detection Pipeline
+==============================================
 
-This module handles the complete evaluation process for trained models,
-including prediction, coordinate matching, and metrics calculation.
-"""
-
-import json
-"""
-Single-Stage SVM Count Prediction Evaluator
-===========================================
-
-This module evaluates trained SVM models for nurdle count prediction using whole-image features.
-Legacy coordinate, SVR, NMS, and window logic has been removed.
+Evaluates trained ensemble SVR models for nurdle count prediction.
 """
 
 import json
@@ -26,8 +16,8 @@ from .metrics import EvaluationMetrics
 
 class ModelEvaluator:
     """
-    Evaluator for single-stage SVM nurdle count prediction models.
-    Handles evaluation of count prediction metrics only.
+    Evaluator for ensemble SVR nurdle count prediction models.
+    Handles evaluation of count prediction metrics.
     """
 
     def __init__(self, logger: Optional[logging.Logger] = None):
@@ -38,7 +28,7 @@ class ModelEvaluator:
                  test_annotations: List[Any],
                  predict_image_func: Callable[[str], int]) -> Dict[str, float]:
         """
-        Evaluate SVM count prediction on test set.
+        Evaluate count predictions on test set.
 
         Args:
             test_annotations: List of ImageAnnotation objects for testing
@@ -47,7 +37,7 @@ class ModelEvaluator:
         Returns:
             Dictionary of evaluation metrics
         """
-        self.logger.info("Evaluating SVM count predictions...")
+        self.logger.info("Evaluating count predictions...")
 
         count_predictions = []
         count_ground_truth = []

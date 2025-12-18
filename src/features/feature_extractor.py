@@ -19,8 +19,6 @@ class FeatureExtractor:
         self.logger = logging.getLogger(__name__)
         self.hog_cell_size = tuple(config.get('hog_cell_size', [4, 4]))
         self.image_size = tuple(config.get('image_size', [1080, 1080]))
-        self.use_hog = bool(config.get('use_hog', True))
-        self.use_lbp = bool(config.get('use_lbp', True))
 
     def _apply_mask(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Apply a binary mask to an image, resizing the mask if needed."""
@@ -50,41 +48,30 @@ class FeatureExtractor:
 
         parts = []
 
-        if self.use_hog:
-            # HOG per channel (captures color gradients)
-            hog_features = []
-            for c in range(3):
-                channel = rgb[:, :, c]
-                hog_feat = hog(
-                    channel,
-                    orientations=9,
-                    pixels_per_cell=self.hog_cell_size,
-                    cells_per_block=(2, 2),
-                    block_norm='L2-Hys',
-                    feature_vector=True
-                )
-                hog_features.append(hog_feat)
-            hog_features = np.concatenate(hog_features)
-            parts.append(hog_features)
+        # Always extract HOG (per channel)
+        hog_features = []
+        for c in range(3):
+            channel = rgb[:, :, c]
+            hog_feat = hog(
+                channel,
+                orientations=9,
+                pixels_per_cell=self.hog_cell_size,
+                cells_per_block=(2, 2),
+                block_norm='L2-Hys',
+                feature_vector=True
+            )
+            hog_features.append(hog_feat)
+        hog_features = np.concatenate(hog_features)
+        parts.append(hog_features)
 
-        if self.use_lbp:
-            # LBP on grayscale for texture
-            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-            lbp = local_binary_pattern(gray, 8, 1, method='uniform')
-            lbp_hist, _ = np.histogram(lbp.ravel(), bins=10, range=(0, 9))
-            lbp_features = lbp_hist.astype(float)
-            parts.append(lbp_features)
-
-        if not parts:
-            raise ValueError("FeatureExtractor: both use_hog and use_lbp are False; no features to extract.")
+        # Always extract LBP (on grayscale for texture)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        lbp = local_binary_pattern(gray, 8, 1, method='uniform')
+        lbp_hist, _ = np.histogram(lbp.ravel(), bins=10, range=(0, 9))
+        lbp_features = lbp_hist.astype(float)
+        parts.append(lbp_features)
 
         return np.concatenate(parts)
-
-    def extract_segmented_features(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """
-        Convenience wrapper to emphasize segmented feature extraction intent.
-        """
-        return self.extract_image_features(image, mask=mask)
 
     def extract_mask_statistics(self, mask: np.ndarray) -> np.ndarray:
         """
@@ -151,6 +138,75 @@ class FeatureExtractor:
         
         return stats
 
+    def extract_hog_features(self, image: np.ndarray) -> np.ndarray:
+        """
+        Extract HOG features only from image.
+        
+        Args:
+            image: Input image (BGR)
+            
+        Returns:
+            HOG feature vector
+        """
+        if image.shape[:2] != self.image_size:
+            image = cv2.resize(image, self.image_size)
+        
+        if len(image.shape) == 3:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        
+        hog_features = []
+        for c in range(3):
+            channel = rgb[:, :, c]
+            hog_feat = hog(
+                channel,
+                orientations=9,
+                pixels_per_cell=self.hog_cell_size,
+                cells_per_block=(2, 2),
+                block_norm='L2-Hys',
+                feature_vector=True
+            )
+            hog_features.append(hog_feat)
+        
+        return np.concatenate(hog_features)
+    
+    def extract_lbp_features(self, image: np.ndarray) -> np.ndarray:
+        """
+        Extract LBP features only from image.
+        
+        Args:
+            image: Input image (BGR)
+            
+        Returns:
+            LBP feature vector
+        """
+        if image.shape[:2] != self.image_size:
+            image = cv2.resize(image, self.image_size)
+        
+        if len(image.shape) == 3:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        lbp = local_binary_pattern(gray, 8, 1, method='uniform')
+        lbp_hist, _ = np.histogram(lbp.ravel(), bins=10, range=(0, 9))
+        
+        return lbp_hist.astype(np.float32)
+    
+    def extract_mask_stats_features(self, mask: np.ndarray) -> np.ndarray:
+        """
+        Extract mask statistics features only.
+        
+        Args:
+            mask: Binary segmentation mask
+            
+        Returns:
+            Mask statistics feature vector
+        """
+        return self.extract_mask_statistics(mask)
+    
     def extract_features_with_mask_stats(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
         Extract combined HOG+LBP features from raw image and mask statistics.
@@ -176,33 +232,15 @@ class FeatureExtractor:
         
         return combined_features
 
-    def extract_features(self, image_path: str) -> np.ndarray:
+    def visualize_hog_features(self, annotations: List[Any], load_image_func, output_dir: str, num_samples: int = 3) -> None:
         """
-        Load image from path and extract combined HOG+LBP features.
-        """
-        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if image is None:
-            raise FileNotFoundError(f"Image not found: {image_path}")
-        return self.extract_image_features(image)
-
-    def generate_training_data(self, annotations: List[Any], load_image_func) -> Iterator[Tuple[np.ndarray, int]]:
-        """
-        Yield (features, count) pairs for each image annotation.
-        """
-        for annotation in annotations:
-            image = load_image_func(annotation.image_path)
-            features = self.extract_image_features(image)
-            count = annotation.nurdle_count
-            yield (features, count)
-
-    def visualize_feature_samples(self, test_annotations: List[Any], load_image_func, output_dir: str, num_samples: int = 3) -> None:
-        """
-        Save three images per test sample: original, HOG, and LBP.
+        Visualize normalized image vs HOG features for sample images.
+        
         Args:
-            test_annotations: List of ImageAnnotation objects (test set)
+            annotations: List of ImageAnnotation objects
             load_image_func: Function to load image from path
             output_dir: Directory to save visualizations
-            num_samples: Max number of samples (default 3)
+            num_samples: Max number of samples to visualize
         """
         import matplotlib.pyplot as plt
         from skimage import exposure
@@ -210,8 +248,8 @@ class FeatureExtractor:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        n_samples = min(num_samples, len(test_annotations), 3)
-        sample_annotations = test_annotations[:n_samples]
+        n_samples = min(num_samples, len(annotations), 3)
+        sample_annotations = annotations[:n_samples]
 
         for annotation in sample_annotations:
             try:
@@ -220,46 +258,162 @@ class FeatureExtractor:
                     image = cv2.resize(image, self.image_size)
 
                 rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                panels = [image]
-                titles = [f'Original\nCount: {annotation.nurdle_count}']
-
-                if self.use_hog:
-                    # HOG per channel (visualize: average of channel HOG images)
-                    hog_images = []
-                    for c in range(3):
-                        _, hog_img = hog(
-                            rgb[:, :, c],
-                            orientations=9,
-                            pixels_per_cell=self.hog_cell_size,
-                            cells_per_block=(2, 2),
-                            block_norm='L2-Hys',
-                            feature_vector=True,
-                            visualize=True
-                        )
-                        hog_images.append(exposure.rescale_intensity(hog_img, in_range='image'))
-                    hog_image = np.mean(hog_images, axis=0)
-                    panels.append(hog_image)
-                    titles.append('HOG Features')
-
-                if self.use_lbp:
-                    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-                    lbp = local_binary_pattern(gray, 8, 1, method='uniform')
-                    panels.append(lbp)
-                    titles.append('LBP Features')
-
-                fig, axes = plt.subplots(1, len(panels), figsize=(6 * len(panels), 6))
-                if len(panels) == 1:
-                    axes = [axes]
-                fig.suptitle(f'Feature Visualization: {annotation.image_id} (TEST sample)', fontsize=14, fontweight='bold')
-                for ax, panel, title in zip(axes, panels, titles):
-                    ax.imshow(panel, cmap='gray')
-                    ax.set_title(title, fontsize=12, fontweight='bold')
-                    ax.axis('off')
+                
+                # Compute HOG visualization (average across channels)
+                hog_images = []
+                for c in range(3):
+                    _, hog_img = hog(
+                        rgb[:, :, c],
+                        orientations=9,
+                        pixels_per_cell=self.hog_cell_size,
+                        cells_per_block=(2, 2),
+                        block_norm='L2-Hys',
+                        feature_vector=True,
+                        visualize=True
+                    )
+                    hog_images.append(exposure.rescale_intensity(hog_img, in_range='image'))
+                hog_image = np.mean(hog_images, axis=0)
+                
+                # Create side-by-side visualization
+                fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+                fig.suptitle(f'HOG Features: {annotation.image_id} (Count: {annotation.nurdle_count})', 
+                            fontsize=14, fontweight='bold')
+                
+                axes[0].imshow(rgb)
+                axes[0].set_title('Normalized Image', fontsize=12, fontweight='bold')
+                axes[0].axis('off')
+                
+                axes[1].imshow(hog_image, cmap='gray')
+                axes[1].set_title('HOG Features', fontsize=12, fontweight='bold')
+                axes[1].axis('off')
+                
                 plt.tight_layout()
-                output_file = output_path / f'{annotation.image_id}_features.png'
+                output_file = output_path / f'{annotation.image_id}_hog_features.png'
                 plt.savefig(output_file, dpi=150, bbox_inches='tight')
                 plt.close()
-                self.logger.info(f"Saved feature visualization: {output_file}")
+                self.logger.info(f"Saved HOG visualization: {output_file}")
             except Exception as e:
-                self.logger.error(f"Error visualizing features for {annotation.image_id}: {e}")
+                self.logger.error(f"Error visualizing HOG features for {annotation.image_id}: {e}")
+
+    def visualize_lbp_features(self, annotations: List[Any], load_image_func, output_dir: str, num_samples: int = 3) -> None:
+        """
+        Visualize normalized image vs LBP features for sample images.
+        
+        Args:
+            annotations: List of ImageAnnotation objects
+            load_image_func: Function to load image from path
+            output_dir: Directory to save visualizations
+            num_samples: Max number of samples to visualize
+        """
+        import matplotlib.pyplot as plt
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        n_samples = min(num_samples, len(annotations), 3)
+        sample_annotations = annotations[:n_samples]
+
+        for annotation in sample_annotations:
+            try:
+                image = load_image_func(annotation.image_path)
+                if image.shape[:2] != self.image_size:
+                    image = cv2.resize(image, self.image_size)
+
+                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+                
+                # Compute LBP
+                lbp_image = local_binary_pattern(gray, 8, 1, method='uniform')
+                
+                # Create side-by-side visualization
+                fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+                fig.suptitle(f'LBP Features: {annotation.image_id} (Count: {annotation.nurdle_count})', 
+                            fontsize=14, fontweight='bold')
+                
+                axes[0].imshow(rgb)
+                axes[0].set_title('Normalized Image', fontsize=12, fontweight='bold')
+                axes[0].axis('off')
+                
+                axes[1].imshow(lbp_image, cmap='gray')
+                axes[1].set_title('LBP Features', fontsize=12, fontweight='bold')
+                axes[1].axis('off')
+                
+                plt.tight_layout()
+                output_file = output_path / f'{annotation.image_id}_lbp_features.png'
+                plt.savefig(output_file, dpi=150, bbox_inches='tight')
+                plt.close()
+                self.logger.info(f"Saved LBP visualization: {output_file}")
+            except Exception as e:
+                self.logger.error(f"Error visualizing LBP features for {annotation.image_id}: {e}")
+
+    def visualize_mask_stats_features(self, annotations: List[Any], load_image_func, segmentation_func, output_dir: str, num_samples: int = 3) -> None:
+        """
+        Visualize segmentation mask vs extracted mask statistics for sample images.
+        
+        Args:
+            annotations: List of ImageAnnotation objects
+            load_image_func: Function to load image from path
+            segmentation_func: Function to compute segmentation mask from image
+            output_dir: Directory to save visualizations
+            num_samples: Max number of samples to visualize
+        """
+        import matplotlib.pyplot as plt
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        n_samples = min(num_samples, len(annotations), 3)
+        sample_annotations = annotations[:n_samples]
+
+        for annotation in sample_annotations:
+            try:
+                image = load_image_func(annotation.image_path)
+                if image.shape[:2] != self.image_size:
+                    image = cv2.resize(image, self.image_size)
+
+                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                mask = segmentation_func(image)
+                
+                # Compute mask statistics for info text
+                mask_stats = self.extract_mask_stats_features(mask)
+                stats_labels = [
+                    f'Coverage: {mask_stats[0]:.2%}',
+                    f'Components: {int(mask_stats[1])}',
+                    f'Area: {mask_stats[2]:.0f}',
+                    f'Centroids: ({mask_stats[3]:.0f}, {mask_stats[4]:.0f})',
+                    f'Aspect Ratio: {mask_stats[5]:.2f}',
+                    f'Solidity: {mask_stats[6]:.2f}',
+                    f'Perimeter: {mask_stats[7]:.0f}',
+                    f'Perimeter/Area: {mask_stats[8]:.4f}'
+                ]
+                
+                # Create side-by-side visualization
+                fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+                fig.suptitle(f'Mask Statistics: {annotation.image_id} (Count: {annotation.nurdle_count})', 
+                            fontsize=14, fontweight='bold')
+                
+                axes[0].imshow(rgb)
+                axes[0].set_title('Normalized Image', fontsize=12, fontweight='bold')
+                axes[0].axis('off')
+                
+                # Overlay mask on second panel
+                mask_colored = np.zeros((*mask.shape, 3), dtype=np.uint8)
+                mask_colored[mask > 0] = [0, 255, 0]  # Green for mask
+                axes[1].imshow(rgb)
+                axes[1].imshow(mask_colored, alpha=0.4)
+                axes[1].set_title('Segmentation Mask', fontsize=12, fontweight='bold')
+                axes[1].axis('off')
+                
+                # Add statistics text
+                stats_text = '\n'.join(stats_labels)
+                fig.text(0.5, -0.05, stats_text, ha='center', fontsize=10, family='monospace',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                
+                plt.tight_layout()
+                output_file = output_path / f'{annotation.image_id}_mask_stats.png'
+                plt.savefig(output_file, dpi=150, bbox_inches='tight')
+                plt.close()
+                self.logger.info(f"Saved mask statistics visualization: {output_file}")
+            except Exception as e:
+                self.logger.error(f"Error visualizing mask statistics for {annotation.image_id}: {e}")
 

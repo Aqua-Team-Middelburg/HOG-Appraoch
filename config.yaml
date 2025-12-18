@@ -1,13 +1,13 @@
-# Nurdle Detection Pipeline - Two-Stage Detection Configuration
-# ==============================================================
-# SVM Classifier → SVR Regressor → Optional Stacking
+# Nurdle Detection Pipeline - Ensemble SVR Configuration
+# ========================================================
+# Trains multiple feature-specific SVR models and combines via meta-learner
 # Optimized for simplicity and correctness
 
 # Project Information
 project:
   name: "Nurdle Detection Pipeline"
   version: "2.0.0"
-  description: "Two-stage nurdle detection with SVM classifier and SVR coordinate regression"
+  description: "Ensemble SVR for nurdle count prediction"
 
 # Data Processing Configuration
 data:
@@ -18,52 +18,44 @@ data:
   output_dir: "output"            # Output directory for results
   save_dir: "saved_outputs"       # Directory to save zipped output folders (set to null to disable)
   count_bins: [0, 20, 40, 60, 80, 110, 150, 220, 1000000000]  # Stratify high-count tail separately
-  cv_folds: 5                    # Folds for stratified CV (reduce if data is very small)
+  cv_folds: 5                     # Folds for stratified cross-validation
 
-# Feature Extraction Configuration  
+# Feature Extraction Configuration
 features:
-  hog_cell_size: [8, 8]           # HOG cell size (image size derived from data.target_resolution)
-  use_hog: false                 # Disable HOG (LBP-only per ablation)
-  use_lbp: true                   # Toggle LBP features (set false for ablation)
+  hog_cell_size: [8, 8]           # HOG cell size
   segmentation:
     min_dist: 8                   # Minimum distance between nurdle centers (watershed parameter)
     min_area: 50                  # Minimum nurdle area in pixels
     max_area: 2000                # Maximum nurdle area in pixels
 
-# Evaluation Configuration  
-evaluation:
-  per_model: true  # Enable separate evaluation for each model type
-  
+# Ensemble Model Configuration
+# Toggle individual models by setting use_hog, use_lbp, use_mask_stats
+ensemble:
+  enabled: true                   # Enable ensemble model
+  use_hog: true                   # Include HOG model in ensemble
+  use_lbp: true                   # Include LBP model in ensemble
+  use_mask_stats: true            # Include mask statistics model in ensemble
+  meta_learner_alpha: 1.0         # Ridge regression regularization strength
+
 # Hyperparameter Optimization Configuration
 optimization:
   svr:
     n_trials: 10
-    c_min: 0.1
-    c_max: 3.0                    # Shrink C range to reduce capacity
-    eps_min: 0.05
-    eps_max: 0.5
-    kernel: linear                # Simpler kernel to discourage overfitting
-    gamma: scale                  # Ignored for linear kernel; kept for compatibility
+    c_min: 0.01
+    c_max: 0.5
+    eps_min: 0.01
+    eps_max: 1.0
+    kernel: linear
+    gamma: scale
     
-# Pipeline Control
+# Pipeline Configuration
 pipeline:
-  # Default steps to run (can be overridden via --steps argument)
   steps:
     - normalization
     - features
     - training
     - evaluation
-  
-  # Checkpoints configuration
   checkpoints:
-    enabled: true  # Enable checkpoint save/load
-    
-  # Error handling
-  error_handling:
-    continue_on_error: false  # Whether to continue pipeline if a step fails
-    save_error_logs: true  # Save detailed error information
-    
-  # Cleanup
+    enabled: true
   cleanup:
-    remove_temp_files: false  # Clean up temporary files after completion (set to false to keep checkpoints)
-    keep_intermediate_results: true  # Keep intermediate results for inspection
+    remove_temp_files: false      # Keep checkpoint files for inspection
