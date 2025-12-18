@@ -24,7 +24,7 @@ data:
 features:
   hog_cell_size: [8, 8]           # HOG cell size (image size derived from data.target_resolution)
   use_hog: true                  # Disable HOG (LBP-only per ablation)
-  use_lbp: false                   # Toggle LBP features (set false for ablation)
+  use_lbp: true                   # Toggle LBP features (set false for ablation)
 
 # Evaluation Configuration  
 evaluation:
@@ -38,7 +38,7 @@ optimization:
     c_max: 3.0                    # Shrink C range to reduce capacity
     eps_min: 0.05
     eps_max: 0.5
-    kernel: linear                # Simpler kernel to discourage overfitting
+    kernel: rbf                # Simpler kernel to discourage overfitting
     gamma: scale                  # Ignored for linear kernel; kept for compatibility
     
 # Pipeline Control
