@@ -20,6 +20,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 # Import pipeline components
 try:
     from src.utils.config import load_config
+    from src.utils.feature_cache import FeatureCache
     from src.data import DataLoader
     from src.features import FeatureExtractor, build_nurdle_mask
     from src.models import ModelTrainer
@@ -48,6 +49,7 @@ class NurdlePipeline:
         # Define checkpoint and output directories
         self.temp_dir = Path('temp')
         self.checkpoint_normalized = self.temp_dir / 'normalized'
+        self.checkpoint_features = self.temp_dir / 'features_cache'
         # Stage output directories
         self.output_dirs = {
             'normalization': Path('output/01_normalization'),
@@ -143,6 +145,34 @@ class NurdlePipeline:
             feats.append(fvec)
             targets.append(ann.nurdle_count)
         return np.array(feats), np.array(targets)
+    
+    def _load_features_from_cache(self) -> Tuple[
+        np.ndarray, np.ndarray, List[Any],
+        np.ndarray, np.ndarray, List[Any]
+    ]:
+        """
+        Load pre-extracted features from cache.
+        
+        Returns:
+            (train_features, train_counts, train_annotations,
+             test_features, test_counts, test_annotations)
+        """
+        if not FeatureCache.cache_exists(self.checkpoint_features):
+            raise FileNotFoundError(f"Feature cache not found at {self.checkpoint_features}. Run --steps normalization features first.")
+        
+        train_feats, train_counts, train_paths, \
+        test_feats, test_counts, test_paths, _ = FeatureCache.load_features(self.checkpoint_features)
+        
+        # Reconstruct annotation objects from paths
+        self.data_loader = DataLoader(self.config.data)
+        self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        
+        train_anns = [ann for ann in self.data_loader.train_annotations if ann.image_path in train_paths]
+        test_anns = [ann for ann in self.data_loader.test_annotations if ann.image_path in test_paths]
+        
+        self.logger.info(f"Loaded cached features: {len(train_feats)} train, {len(test_feats)} test")
+        return train_feats, train_counts, train_anns, test_feats, test_counts, test_anns
+    
     
     def _setup_logging(self):
         """Setup pipeline-specific logging."""
@@ -309,15 +339,14 @@ class NurdlePipeline:
     
     def _run_features_stage(self) -> Dict[str, Any]:
         """
-        Stage 2: Extract and visualize features.
+        Stage 2: Extract and cache features.
 
         Prerequisites:
         - temp/normalized/ must exist
 
         Outputs:
-        - output/03_features/ - Feature visualizations (HOG overlays, LBP patterns)
-
-        Note: Features are NOT saved, training uses generator.
+        - temp/features_cache/ - Cached feature vectors (train + test)
+        - output/02_features/ - Feature visualizations
         """
         if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Features', 'normalization'):
             raise FileNotFoundError(f"ERROR: Features - Normalized data not found. Run --steps normalization first.")
@@ -331,16 +360,78 @@ class NurdlePipeline:
             'image_size': image_size,
             'use_hog': self.config.features.get('use_hog', True),
             'use_lbp': self.config.features.get('use_lbp', True),
+            'segmentation': self.config.features.get('segmentation', {}),
         }
         self.feature_extractor = FeatureExtractor(feature_config)
+        
+        # Extract features for all training and test images
+        self.logger.info("Computing features for training set...")
+        train_features = []
+        train_counts = []
+        train_paths = []
+        seg_config = self.config.features.get('segmentation', {})
+        
+        for ann in self.data_loader.train_annotations:
+            image = self.data_loader.load_image(ann.image_path)
+            mask = build_nurdle_mask(
+                image,
+                min_dist=seg_config.get('min_dist', 8),
+                min_area=seg_config.get('min_area', 50),
+                max_area=seg_config.get('max_area', 2000)
+            )
+            features = self.feature_extractor.extract_image_features(image, mask=mask)
+            train_features.append(features)
+            train_counts.append(ann.nurdle_count)
+            train_paths.append(ann.image_path)
+        
+        self.logger.info("Computing features for test set...")
+        test_features = []
+        test_counts = []
+        test_paths = []
+        
+        for ann in self.data_loader.test_annotations:
+            image = self.data_loader.load_image(ann.image_path)
+            mask = build_nurdle_mask(
+                image,
+                min_dist=seg_config.get('min_dist', 8),
+                min_area=seg_config.get('min_area', 50),
+                max_area=seg_config.get('max_area', 2000)
+            )
+            features = self.feature_extractor.extract_image_features(image, mask=mask)
+            test_features.append(features)
+            test_counts.append(ann.nurdle_count)
+            test_paths.append(ann.image_path)
+        
+        # Convert to numpy arrays
+        train_features = np.array(train_features)
+        train_counts = np.array(train_counts)
+        test_features = np.array(test_features)
+        test_counts = np.array(test_counts)
+        
+        # Save feature cache
+        self.logger.info("Saving feature cache...")
+        FeatureCache.save_features(
+            self.checkpoint_features,
+            train_features, train_counts, train_paths,
+            test_features, test_counts, test_paths,
+            feature_config
+        )
+        
         # Visualize feature samples for up to 3 test images
+        self.logger.info("Generating feature visualizations...")
         self.feature_extractor.visualize_feature_samples(
             self.data_loader.test_annotations,
             self.data_loader.load_image,
             str(output_dir),
             num_samples=3
         )
-        return {'visualization_dir': str(output_dir)}
+        
+        return {
+            'train_features_shape': train_features.shape,
+            'test_features_shape': test_features.shape,
+            'feature_cache_dir': str(self.checkpoint_features),
+            'visualization_dir': str(output_dir)
+        }
     
     def _run_tuning_stage(self) -> Dict[str, Any]:
         """
@@ -348,6 +439,7 @@ class NurdlePipeline:
 
         Prerequisites:
         - temp/normalized/ must exist
+        - temp/features_cache/ must exist (from features stage)
 
         Outputs:
         - output/03_tuning/ - Tuning results and best parameters
@@ -355,20 +447,15 @@ class NurdlePipeline:
         from src.optuna import OptunaTuner
         if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Tuning', 'normalization'):
             raise FileNotFoundError(f"ERROR: Tuning - Normalized data not found. Run --steps normalization first.")
+        if not FeatureCache.cache_exists(self.checkpoint_features):
+            raise FileNotFoundError(f"ERROR: Tuning - Feature cache not found. Run --steps normalization features first.")
+        
         output_dir = self._create_stage_output_dir('tuning')
-        self.logger.info("Loading normalized data for tuning...")
-        self.data_loader = DataLoader(self.config.data)
-        self.data_loader.load_normalized_data(self.checkpoint_normalized)
-        image_size = self._get_feature_image_size()
-        feature_config = {
-            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': image_size,
-            'use_hog': self.config.features.get('use_hog', True),
-            'use_lbp': self.config.features.get('use_lbp', True),
-        }
-        self.feature_extractor = FeatureExtractor(feature_config)
-        train_annotations = self.data_loader.train_annotations
-        y_all = np.array([ann.nurdle_count for ann in train_annotations])
+        
+        self.logger.info("Loading cached features for tuning...")
+        train_features, train_counts, train_annotations, _, _, _ = self._load_features_from_cache()
+        
+        y_all = train_counts
         strata = self._bin_labels(y_all)
 
         config_dict = getattr(self.config, '_config', self.config if isinstance(self.config, dict) else {})
@@ -380,10 +467,10 @@ class NurdlePipeline:
             fold_mape = []
             bnds = self._svr_bounds()
             denom_floor = 1.0
-            for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
+            for train_idx, val_idx in splitter.split(np.arange(len(train_features)),
                                                     strata if isinstance(splitter, StratifiedKFold) else None):
-                X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
-                X_val, y_val = self._build_features_from_indices(train_annotations, val_idx, self.feature_extractor)
+                X_tr, y_tr = train_features[train_idx], train_counts[train_idx]
+                X_val, y_val = train_features[val_idx], train_counts[val_idx]
                 y_tr_log = np.log1p(y_tr)
                 C_val = max(bnds['c_min'], min(params.get('svr_c', 1.0), bnds['c_max']))
                 eps_val = max(bnds['eps_min'], min(params.get('svr_epsilon', 0.1), bnds['eps_max']))
@@ -508,6 +595,7 @@ class NurdlePipeline:
 
         Prerequisites:
         - temp/normalized/ must exist
+        - temp/features_cache/ must exist (from features stage)
 
         Outputs:
         - output/04_training/ - Training metrics and curves
@@ -515,18 +603,19 @@ class NurdlePipeline:
         """
         if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Training', 'normalization'):
             raise FileNotFoundError(f"ERROR: Training - Normalized data not found. Run --steps normalization first.")
+        if not FeatureCache.cache_exists(self.checkpoint_features):
+            raise FileNotFoundError(f"ERROR: Training - Feature cache not found. Run --steps normalization features first.")
+        
         output_dir = self._create_stage_output_dir('training')
-        self.logger.info("Loading normalized data for training...")
-        self.data_loader = DataLoader(self.config.data)
-        self.data_loader.load_normalized_data(self.checkpoint_normalized)
-        image_size = self._get_feature_image_size()
-        feature_config = {
-            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': image_size,
-            'use_hog': self.config.features.get('use_hog', True),
-            'use_lbp': self.config.features.get('use_lbp', True),
-        }
-        self.feature_extractor = FeatureExtractor(feature_config)
+        self.logger.info("Loading cached features for training...")
+        
+        train_features, train_counts, train_annotations, _, _, _ = self._load_features_from_cache()
+        
+        # For ablation, we still need the data loader to reload images with different feature configs
+        if self.config.features.get('use_lbp', True) or self.config.features.get('use_hog', True):
+            self.data_loader = DataLoader(self.config.data)
+            self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        
         # Load best params from tuning if available
         tuning_best_path = self.output_dirs['tuning'] / 'best_params.json'
         config_dict = self.config if isinstance(self.config, dict) else vars(self.config)
@@ -559,8 +648,8 @@ class NurdlePipeline:
         denom_floor = 1.0
         for train_idx, val_idx in splitter.split(np.arange(len(train_annotations)),
                                                  strata if isinstance(splitter, StratifiedKFold) else None):
-            X_tr, y_tr = self._build_features_from_indices(train_annotations, train_idx, self.feature_extractor)
-            X_val, y_val = self._build_features_from_indices(train_annotations, val_idx, self.feature_extractor)
+            X_tr, y_tr = train_features[train_idx], train_counts[train_idx]
+            X_val, y_val = train_features[val_idx], train_counts[val_idx]
             y_tr_log = np.log1p(y_tr)
             reg = make_pipeline(
                 StandardScaler(),
@@ -599,8 +688,9 @@ class NurdlePipeline:
             'cv_mape_std': float(np.std(fold_mape)),
         }
 
-        # Fit final model on full training set (build once)
-        full_features, full_counts = self._build_features_from_indices(train_annotations, np.arange(len(train_annotations)), self.feature_extractor)
+        # Fit final model on full training set
+        full_features = train_features
+        full_counts = train_counts
         training_data = list(zip(full_features, full_counts))
         config_dict['svr_bounds'] = self._svr_bounds()
         self.model_trainer = ModelTrainer(config_dict)
@@ -780,6 +870,7 @@ class NurdlePipeline:
 
         Prerequisites:
         - temp/normalized/ must exist
+        - temp/features_cache/ must exist (from features stage)
         - output/models/ must have trained models
 
         Outputs:
@@ -787,41 +878,27 @@ class NurdlePipeline:
         """
         if not self._check_checkpoint_exists(self.checkpoint_normalized, 'Evaluation', 'normalization'):
             raise FileNotFoundError(f"ERROR: Evaluation - Normalized data not found. Run --steps normalization first.")
+        if not FeatureCache.cache_exists(self.checkpoint_features):
+            raise FileNotFoundError(f"ERROR: Evaluation - Feature cache not found. Run --steps normalization features first.")
         if not self.models_dir.exists() or not any(self.models_dir.glob('*.pkl')):
             raise FileNotFoundError(f"ERROR: Evaluation - No trained models found in {self.models_dir}. Run --steps training first.")
+        
         output_dir = self._create_stage_output_dir('evaluation')
-        self.logger.info("Loading normalized data for evaluation...")
-        self.data_loader = DataLoader(self.config.data)
-        self.data_loader.load_normalized_data(self.checkpoint_normalized)
-        image_size = self._get_feature_image_size()
-        feature_config = {
-            'hog_cell_size': self.config.features.get('hog_cell_size', [4, 4]),
-            'image_size': image_size,
-            'use_hog': self.config.features.get('use_hog', True),
-            'use_lbp': self.config.features.get('use_lbp', True),
-        }
-        feature_extractor = FeatureExtractor(feature_config)
+        self.logger.info("Loading cached features for evaluation...")
+        
+        _, _, train_annotations, test_features, test_counts, test_annotations = self._load_features_from_cache()
+        
         model_trainer = ModelTrainer(self.config if isinstance(self.config, dict) else vars(self.config))
         model_trainer.load_model(str(self.models_dir))
-        test_annots = self.data_loader.test_annotations
-        y_true = []
+        
+        # Use cached test features directly (no need to extract)
+        y_true = test_counts
         y_pred = []
-        seg_config = self.config.features.get('segmentation', {})
-        for batch in self.data_loader.get_image_batches(test_annots):
-            self.logger.debug(f"Evaluating batch of {len(batch)} images (batch_size={self.data_loader.batch_size})")
-            for annot in batch:
-                image = self.data_loader.load_image(annot.image_path)
-                # Test-time preprocessing: restrict HOG/LBP to segmented nurdle regions
-                mask = build_nurdle_mask(
-                    image,
-                    min_dist=seg_config.get('min_dist', 8),
-                    min_area=seg_config.get('min_area', 50),
-                    max_area=seg_config.get('max_area', 2000)
-                )
-                features = feature_extractor.extract_image_features(image, mask=mask)
-                pred_count = model_trainer.predict_count(features)
-                y_true.append(annot.nurdle_count)
-                y_pred.append(pred_count)
+        for features in test_features:
+            pred_count = model_trainer.predict_count(features)
+            y_pred.append(pred_count)
+        
+        y_pred = np.array(y_pred)
         from sklearn.metrics import mean_absolute_error, mean_squared_error
         mae = mean_absolute_error(y_true, y_pred)
         rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -923,8 +1000,10 @@ class NurdlePipeline:
         plt.tight_layout()
         plt.savefig(output_dir / 'true_vs_pred.png')
         plt.close()
-        # Individual test image visualizations
-        for ann, pred_count in zip(test_annots, y_pred):
+        # Individual test image visualizations (load images for visualization)
+        self.data_loader = DataLoader(self.config.data)
+        self.data_loader.load_normalized_data(self.checkpoint_normalized)
+        for ann, pred_count in zip(test_annotations, y_pred):
             img = self.data_loader.load_image(ann.image_path)
             # Convert BGR to RGB for correct color display
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
