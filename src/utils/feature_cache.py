@@ -49,6 +49,25 @@ class FeatureCache:
         """
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Basic integrity checks to prevent silent data leakage.
+        if len(train_features) != len(train_counts) or len(train_features) != len(train_paths):
+            raise ValueError(
+                "Train cache mismatch: features/counts/paths lengths differ "
+                f"({len(train_features)=}, {len(train_counts)=}, {len(train_paths)=})"
+            )
+        if len(test_features) != len(test_counts) or len(test_features) != len(test_paths):
+            raise ValueError(
+                "Test cache mismatch: features/counts/paths lengths differ "
+                f"({len(test_features)=}, {len(test_counts)=}, {len(test_paths)=})"
+            )
+        overlap = set(train_paths).intersection(test_paths)
+        if overlap:
+            sample = sorted(list(overlap))[:10]
+            raise ValueError(
+                "Data leakage detected: train_paths and test_paths overlap. "
+                f"Overlap count={len(overlap)}; sample={sample}"
+            )
         
         # Save feature arrays
         np.save(cache_dir / "train_features.npy", train_features)
@@ -70,8 +89,14 @@ class FeatureCache:
             json.dump(metadata, f, indent=2)
         
         logger.info(f"Feature cache saved to {cache_dir}")
-        logger.info(f"  Train: {len(train_features)} samples, {train_features.shape[1] if len(train_features) > 0 else 0} features")
-        logger.info(f"  Test:  {len(test_features)} samples, {test_features.shape[1] if len(test_features) > 0 else 0} features")
+        logger.info(
+            f"  Train: {len(train_features)} samples, "
+            f"{train_features.shape[1] if len(train_features) > 0 else 0} features/sample"
+        )
+        logger.info(
+            f"  Test:  {len(test_features)} samples, "
+            f"{test_features.shape[1] if len(test_features) > 0 else 0} features/sample"
+        )
     
     @staticmethod
     def load_features(cache_dir: Path) -> Tuple[
@@ -106,8 +131,8 @@ class FeatureCache:
         config = metadata.get("feature_config", {})
         
         logger.info(f"Feature cache loaded from {cache_dir}")
-        logger.info(f"  Train: {len(train_features)} samples, {train_features.shape[1]} features")
-        logger.info(f"  Test:  {len(test_features)} samples, {test_features.shape[1]} features")
+        logger.info(f"  Train: {len(train_features)} samples, {train_features.shape[1]} features/sample")
+        logger.info(f"  Test:  {len(test_features)} samples, {test_features.shape[1]} features/sample")
         
         return train_features, train_counts, train_paths, \
                test_features, test_counts, test_paths, config

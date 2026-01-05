@@ -38,7 +38,7 @@ optimization:
     c_max: 3.0                    # Shrink C range to reduce capacity
     eps_min: 0.05
     eps_max: 0.5
-    kernel: rbf                # Simpler kernel to discourage overfitting
+    kernel: linear                # Simpler kernel to discourage overfitting
     gamma: scale                  # Ignored for linear kernel; kept for compatibility
     
 # Pipeline Control
