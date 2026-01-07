@@ -32,9 +32,9 @@ features:
 # Toggle individual models by setting use_hog, use_lbp, use_mask_stats
 ensemble:
   enabled: true                   # Enable ensemble model
-  use_hog: true                   # Include HOG model in ensemble
+  use_hog: false                   # Include HOG model in ensemble
   use_lbp: true                   # Include LBP model in ensemble
-  use_mask_stats: false            # Include mask statistics model in ensemble
+  use_mask_stats: true            # Include mask statistics model in ensemble
   meta_learner_alpha: 1.0         # Ridge regression regularization strength
 
 # Hyperparameter Optimization Configuration
@@ -45,7 +45,7 @@ optimization:
     c_max: 0.5
     eps_min: 0.01
     eps_max: 1.0
-    kernel: linear
+    kernel: rbf
     gamma: scale
     
 # Pipeline Configuration
