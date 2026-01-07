@@ -34,7 +34,7 @@ ensemble:
   enabled: true                   # Enable ensemble model
   use_hog: true                   # Include HOG model in ensemble
   use_lbp: true                   # Include LBP model in ensemble
-  use_mask_stats: true            # Include mask statistics model in ensemble
+  use_mask_stats: false            # Include mask statistics model in ensemble
   meta_learner_alpha: 1.0         # Ridge regression regularization strength
 
 # Hyperparameter Optimization Configuration
